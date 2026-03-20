@@ -1,4 +1,4 @@
-// credibility_pf_v2.mod — Nonlinear PF with credibility capital stock
+// credibility_pf_v2.mod -- Nonlinear PF with credibility capital stock
 // Replaces the memoryless sigmoid omega_t = f(pi_t) with a dynamic
 // credibility stock: cred depletes when off target, rebuilds when on target.
 //

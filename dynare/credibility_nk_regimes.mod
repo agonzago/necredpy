@@ -4,9 +4,9 @@
 // so that parse_two_regime_model() returns matrices + switching function
 // in a single call.
 //
-// State vector: [y, pi, ii, pi_lag]
+// State vector: [y, pi, ii]
 
-var y pi ii pi_lag;
+var y pi ii;
 varexo eps_d eps_s eps_m;
 
 parameters beta sigma kappa rho_i phi_pi phi_y omega
@@ -33,11 +33,9 @@ model;
   // IS curve
   y = y(+1) - sigma*(ii - pi(+1)) + eps_d;
   // Phillips curve with credibility weight
-  pi = omega*beta*pi(+1) + (1-omega)*pi_lag + kappa*y + eps_s;
+  pi = omega*beta*pi(+1) + (1-omega)*pi(-1) + kappa*y + eps_s;
   // Taylor rule
   ii = rho_i*ii(-1) + (1-rho_i)*(phi_pi*pi + phi_y*y) + eps_m;
-  // Identity: lagged inflation
-  pi_lag = pi(-1);
 end;
 
 regimes;

@@ -25,6 +25,9 @@ dynare/*.mat
 *.synctex.gz
 *.out
 
+# Generated figures
+figures/
+
 # OS
 .DS_Store
 Thumbs.db

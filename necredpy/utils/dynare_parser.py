@@ -389,7 +389,7 @@ def jax_lambdify(parsed):
 
 
 # ---------------------------------------------------------------------------
-# Convenience: parse + evaluate → numpy matrices
+# Convenience: parse + evaluate -> numpy matrices
 # ---------------------------------------------------------------------------
 
 def get_model_matrices(mod_string, params_dict, verbose=False):

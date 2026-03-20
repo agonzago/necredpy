@@ -35,3 +35,5 @@ from necredpy.utils.dynare_parser import (
     parse_two_regime_model,
     extract_priors,
 )
+
+from necredpy.model import Model

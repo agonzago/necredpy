@@ -1,4 +1,4 @@
-// credibility_pf.mod — Nonlinear perfect foresight with endogenous credibility
+// credibility_pf.mod -- Nonlinear perfect foresight with endogenous credibility
 // omega_t switches smoothly between omega_H and omega_L based on |pi|
 //
 // Solved by Dynare's perfect_foresight_solver (Newton on stacked system)
