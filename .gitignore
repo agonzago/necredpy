@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+release/
+
+# Dynare output
+*.log
+*.m~
+dynare/+*/
+dynare/_tmp_*
+dynare/*.mat
+*.o
+
+# LaTeX
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.out
+
+# OS
+.DS_Store
+Thumbs.db
+octave-workspace
+texput.log
+
+# IDE
+.vscode/
+.idea/
+
+# Data (large files)
+data/*.csv
+data/*.xlsx
+data/*.mat
+
+# Keep structure
+!.gitkeep
