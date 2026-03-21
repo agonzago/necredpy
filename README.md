@@ -31,9 +31,24 @@ irf[["pi_agg", "credibility"]].plot(subplots=True)
 # Simulate with custom shock sequences
 data = m.simulate({"eps_pi1": [3.0, 1.0, 0.5], "eps_m": [0, 0, 0.2]}, T=60)
 
+# BanRep Gaussian credibility (user-defined signal + accumulation)
+m_banrep = Model("dynare/five_sector_banrep_cred.mod")
+irf_banrep = m_banrep.irf("eps_pi1", size=5.0, T=60, credibility=True)
+irf_banrep[["pi_agg", "credibility"]].plot(subplots=True)
+
+# Compare Isard vs BanRep credibility dynamics
+irf_isard = m.irf("eps_pi1", size=5.0, T=60, credibility=True)
+print("Isard cred min:", irf_isard["credibility"].min())
+print("BanRep cred min:", irf_banrep["credibility"].min())
+
 # Bayesian estimation (requires priors in the .mod file)
-m = Model("dynare/credibility_nk_regimes.mod")
-results = m.estimate(data, obs_vars=["y", "pi", "ii"])
+m_est = Model("dynare/credibility_nk_regimes.mod")
+results = m_est.estimate(data, obs_vars=["y", "pi", "ii"])
+print(results.summary)
+
+# Estimation with BanRep credibility
+m_banrep_est = Model("dynare/credibility_nk_banrep.mod")
+results = m_banrep_est.estimate(data, obs_vars=["y", "pi", "ii"])
 print(results.summary)
 ```
 
