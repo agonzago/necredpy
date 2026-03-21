@@ -1016,11 +1016,288 @@ def build_switching_fn(regime_spec, var_names):
 
 
 # ---------------------------------------------------------------------------
+# Pluggable credibility functions
+# ---------------------------------------------------------------------------
+
+def extract_credibility(mod_string):
+    """Parse the credibility; ... end; block from a .mod file.
+
+    Returns
+    -------
+    cred_spec : dict or None
+        Keys: 'monitor', 'threshold', 'cred_init',
+              'signal_expr', 'accumulation_expr',
+              'signal_lag' (int, 0 or 1),
+        Returns None if no credibility; block found.
+    """
+    # Strip block comments
+    processed = re.sub(r'/\*.*?\*/', '', mod_string, flags=re.DOTALL)
+    lines = processed.split('\n')
+    cleaned = [re.sub(r'(//|%).*$', '', line).strip() for line in lines]
+    processed = " ".join(cleaned)
+
+    # Find credibility; ... end; block
+    match = re.search(
+        r'(?i)\bcredibility\b\s*;(.*?)\bend\b\s*;',
+        processed, re.DOTALL
+    )
+    if not match:
+        return None
+
+    block = match.group(1)
+
+    cred_spec = {}
+
+    # Parse key: value; pairs
+    for key in ['monitor', 'threshold', 'cred_init']:
+        pattern = r'\b' + key + r'\s*:\s*([^;]+);'
+        m = re.search(pattern, block, re.IGNORECASE)
+        if m:
+            val_str = m.group(1).strip()
+            if key == 'monitor':
+                cred_spec[key] = val_str
+            else:
+                try:
+                    cred_spec[key] = float(val_str)
+                except ValueError:
+                    cred_spec[key] = val_str
+
+    # Defaults
+    cred_spec.setdefault('threshold', 0.5)
+    cred_spec.setdefault('cred_init', 1.0)
+
+    # Parse signal = <expr>;
+    sig_match = re.search(r'\bsignal\s*=\s*([^;]+);', block, re.IGNORECASE)
+    if sig_match:
+        cred_spec['signal_expr'] = sig_match.group(1).strip()
+    else:
+        cred_spec['signal_expr'] = None
+
+    # Parse accumulation = <expr>;
+    acc_match = re.search(r'\baccumulation\s*=\s*([^;]+);', block, re.IGNORECASE)
+    if acc_match:
+        cred_spec['accumulation_expr'] = acc_match.group(1).strip()
+    else:
+        cred_spec['accumulation_expr'] = None
+
+    # Detect lag usage: pi(-1) in signal expression
+    if cred_spec.get('signal_expr'):
+        cred_spec['signal_lag'] = 1 if 'pi(-1)' in cred_spec['signal_expr'] else 0
+    else:
+        cred_spec['signal_lag'] = 0
+
+    return cred_spec
+
+
+def compile_credibility_fn(cred_spec, param_names, param_defaults):
+    """Compile signal and accumulation expressions into callables.
+
+    Parameters
+    ----------
+    cred_spec : dict
+        Output of extract_credibility().
+    param_names : list of str
+        All parameter names from the .mod file.
+    param_defaults : dict
+        Default parameter values.
+
+    Returns
+    -------
+    compiled : dict with keys:
+        'signal_fn'       : callable(pi, pi_lag, params_dict) -> float
+        'accumulation_fn' : callable(cred, signal, miss, params_dict) -> float
+        'monitor'         : str
+        'threshold'       : float
+        'cred_init'       : float
+        'signal_lag'      : int (0 or 1)
+    """
+    compiled = {
+        'monitor': cred_spec['monitor'],
+        'threshold': cred_spec['threshold'],
+        'cred_init': cred_spec['cred_init'],
+        'signal_lag': cred_spec.get('signal_lag', 0),
+    }
+
+    # ---- Signal function ----
+    sig_expr_str = cred_spec.get('signal_expr')
+
+    if sig_expr_str is None:
+        compiled['signal_fn'] = None
+    else:
+        # Replace pi(-1) with a symbol pi_lag, and plain pi with pi_curr
+        expr_str = sig_expr_str.replace('pi(-1)', 'pi_lag')
+
+        # Replace ^ with ** for sympy
+        expr_str = expr_str.replace('^', '**')
+
+        sym_pi = sympy.Symbol('pi')
+        sym_pi_lag = sympy.Symbol('pi_lag')
+        sym_pi_star = sympy.Symbol('pi_star')
+
+        param_syms = {p: sympy.Symbol(p) for p in param_names}
+        local_dict = {'pi': sym_pi, 'pi_lag': sym_pi_lag,
+                      'pi_star': sym_pi_star}
+        local_dict.update(param_syms)
+
+        local_dict['exp'] = sympy.exp
+        local_dict['log'] = sympy.log
+        local_dict['abs'] = sympy.Abs
+        local_dict['sqrt'] = sympy.sqrt
+
+        sym_expr = sympy.sympify(expr_str, locals=local_dict)
+
+        all_sym_names = {str(s) for s in sym_expr.free_symbols}
+        used_params = [p for p in param_names if p in all_sym_names]
+        compiled['signal_params'] = used_params
+
+        arg_list = [sym_pi, sym_pi_lag, sym_pi_star]
+        arg_list += [param_syms[p] for p in used_params]
+
+        sig_numpy = sympy.lambdify(arg_list, sym_expr, modules='numpy')
+
+        # Use default arg to capture current value (avoid closure late-binding)
+        def signal_fn(pi_val, pi_lag_val, params_dict, pi_star=0.0,
+                      _fn=sig_numpy, _params=list(used_params)):
+            args = [pi_val, pi_lag_val, pi_star]
+            args += [params_dict[p] for p in _params]
+            return float(_fn(*args))
+
+        compiled['signal_fn'] = signal_fn
+
+    # ---- Accumulation function ----
+    acc_expr_str = cred_spec.get('accumulation_expr')
+
+    if acc_expr_str is None:
+        compiled['accumulation_fn'] = None
+    else:
+        expr_str = acc_expr_str.replace('^', '**')
+
+        sym_cred = sympy.Symbol('cred')
+        sym_s = sympy.Symbol('s')
+        sym_miss = sympy.Symbol('miss')
+
+        param_syms = {p: sympy.Symbol(p) for p in param_names}
+        local_dict = {'cred': sym_cred, 's': sym_s, 'miss': sym_miss}
+        local_dict.update(param_syms)
+        local_dict['exp'] = sympy.exp
+        local_dict['log'] = sympy.log
+        local_dict['abs'] = sympy.Abs
+        local_dict['sqrt'] = sympy.sqrt
+        local_dict['max'] = sympy.Max
+        local_dict['min'] = sympy.Min
+
+        sym_expr = sympy.sympify(expr_str, locals=local_dict)
+
+        all_sym_names = {str(s) for s in sym_expr.free_symbols}
+        used_params = [p for p in param_names if p in all_sym_names]
+        compiled['accumulation_params'] = used_params
+
+        arg_list = [sym_cred, sym_s, sym_miss]
+        arg_list += [param_syms[p] for p in used_params]
+
+        acc_numpy = sympy.lambdify(arg_list, sym_expr, modules='numpy')
+
+        # Use default arg to capture current value (avoid closure late-binding)
+        def accumulation_fn(cred_val, signal_val, miss_val, params_dict,
+                            _fn=acc_numpy, _params=list(used_params)):
+            args = [cred_val, signal_val, miss_val]
+            args += [params_dict[p] for p in _params]
+            return float(_fn(*args))
+
+        compiled['accumulation_fn'] = accumulation_fn
+
+    return compiled
+
+
+def build_credibility_switching_fn(compiled, var_names, param_values,
+                                   band=None):
+    """Build a switching function from compiled credibility spec.
+
+    Returns a callable with the same signature as build_switching_fn():
+        switching_fn(u_path) -> regime_seq (ndarray of 0/1)
+        switching_fn.cred_path available after call
+
+    Parameters
+    ----------
+    compiled : dict
+        Output of compile_credibility_fn().
+    var_names : list of str
+        Variable names from the model.
+    param_values : dict
+        Current parameter values (for evaluating signal/accumulation).
+    band : float or None
+        Tolerance band for the miss indicator.
+    """
+    monitor_var = compiled['monitor']
+    pi_index = var_names.index(monitor_var)
+    cred_threshold = compiled['threshold']
+    cred_init = compiled['cred_init']
+    signal_lag = compiled['signal_lag']
+    signal_fn = compiled['signal_fn']
+    accumulation_fn = compiled['accumulation_fn']
+
+    use_isard_signal = (signal_fn is None)
+    use_isard_accumulation = (accumulation_fn is None)
+
+    if use_isard_accumulation:
+        delta_up = param_values.get('delta_up', 0.05)
+        delta_down = param_values.get('delta_down', 0.70)
+
+    if band is None:
+        band = param_values.get('epsilon_bar',
+               param_values.get('band', 2.0))
+
+    def switching_fn(u_path):
+        T = u_path.shape[0]
+        regime_seq = np.zeros(T, dtype=int)
+        cred_path = np.zeros(T)
+        signal_path = np.zeros(T)
+
+        cred = cred_init
+
+        for t in range(T):
+            pi_t = u_path[t, pi_index]
+            pi_lag = u_path[t - 1, pi_index] if t > 0 else 0.0
+
+            miss = 1.0 if abs(pi_t) > band else 0.0
+
+            if use_isard_signal:
+                sig = 0.0
+            else:
+                if signal_lag == 1:
+                    sig = signal_fn(pi_t, pi_lag, param_values)
+                else:
+                    sig = signal_fn(pi_t, pi_t, param_values)
+            signal_path[t] = sig
+
+            if use_isard_accumulation:
+                if miss > 0.5:
+                    cred = cred - delta_down * cred
+                else:
+                    cred = cred + delta_up * (1.0 - cred)
+            else:
+                cred = accumulation_fn(cred, sig, miss, param_values)
+
+            cred = max(0.0, min(1.0, cred))
+            cred_path[t] = cred
+
+            regime_seq[t] = 1 if cred < cred_threshold else 0
+
+        switching_fn.cred_path = cred_path
+        switching_fn.signal_path = signal_path
+        return regime_seq
+
+    switching_fn.cred_path = None
+    switching_fn.signal_path = None
+    return switching_fn
+
+
+# ---------------------------------------------------------------------------
 # High-level: compile once / evaluate many (estimation-ready architecture)
 # ---------------------------------------------------------------------------
 
 def compile_two_regime_model(mod_string, verbose=False):
-    """Parse a .mod file with a regimes block (expensive sympy step, done once).
+    """Parse a .mod file with a regimes and/or credibility block.
 
     For estimation: call this once, then call evaluate_two_regime_model()
     repeatedly with different param_overrides per MCMC draw.
@@ -1028,25 +1305,42 @@ def compile_two_regime_model(mod_string, verbose=False):
     Parameters
     ----------
     mod_string : str
-        Full .mod file content with regimes; ... end; block.
+        Full .mod file content with regimes; and/or credibility; block.
     verbose : bool
 
     Returns
     -------
     compiled : dict with keys:
         'parsed' : dict from parse_mod() (lambdified functions)
-        'regime_spec_raw' : dict from extract_regimes() (unresolved strings)
+        'regime_spec_raw' : dict from extract_regimes() (may be None)
+        'credibility_spec' : dict from extract_credibility() (may be None)
+        'credibility_compiled' : dict from compile_credibility_fn() (if applicable)
     """
     regime_spec_raw = extract_regimes(mod_string)
-    if regime_spec_raw is None:
-        raise ValueError("No 'regimes; ... end;' block found in .mod file.")
+    cred_spec = extract_credibility(mod_string)
+
+    if regime_spec_raw is None and cred_spec is None:
+        raise ValueError(
+            "No 'regimes; ... end;' or 'credibility; ... end;' "
+            "block found in .mod file.")
 
     parsed = parse_mod(mod_string, verbose=verbose)
 
-    return {
+    result = {
         'parsed': parsed,
         'regime_spec_raw': regime_spec_raw,
+        'credibility_spec': cred_spec,
     }
+
+    # Pre-compile credibility expressions (expensive sympy step)
+    if cred_spec is not None:
+        result['credibility_compiled'] = compile_credibility_fn(
+            cred_spec,
+            parsed['param_names'],
+            parsed['param_defaults'],
+        )
+
+    return result
 
 
 def evaluate_two_regime_model(compiled, param_overrides=None):
@@ -1075,12 +1369,19 @@ def evaluate_two_regime_model(compiled, param_overrides=None):
     import copy
     parsed = compiled['parsed']
     # Deep copy to avoid mutating the raw spec (strings -> floats)
-    regime_spec = copy.deepcopy(compiled['regime_spec_raw'])
+    regime_spec = copy.deepcopy(compiled.get('regime_spec_raw'))
 
     # Build base params from defaults + overrides
     base_params = dict(parsed['param_defaults'])
     if param_overrides:
         base_params.update(param_overrides)
+
+    if regime_spec is None:
+        # No regimes; block. Build a minimal regime_spec from parameters.
+        regime_spec = {
+            'M1_params': {'omega': base_params.get('omega_H', 0.65)},
+            'M2_params': {'omega': base_params.get('omega_L', 0.35)},
+        }
 
     # Resolve regime-specific parameter overrides
     params_M1 = dict(base_params)
@@ -1125,8 +1426,6 @@ def evaluate_two_regime_model(compiled, param_overrides=None):
     matrices_M2 = (A2, B2, C2, D2)
 
     # Resolve ALL switching parameters against model parameter names.
-    # This allows the regimes block to reference declared parameters
-    # (e.g., band: epsilon_bar;) so they are estimable via param_overrides.
     switch_numeric_keys = ['band', 'cred_threshold', 'delta_up', 'delta_down',
                            'cred_init', 'k_restore']
     for key in switch_numeric_keys:
@@ -1134,8 +1433,18 @@ def evaluate_two_regime_model(compiled, param_overrides=None):
             regime_spec[key] = _resolve_param_value(
                 regime_spec[key], base_params)
 
-    # Build switching function
-    switching_fn = build_switching_fn(regime_spec, parsed['var_names'])
+    # Check if we have a pluggable credibility specification
+    cred_compiled = compiled.get('credibility_compiled')
+    if cred_compiled is not None:
+        # Use the pluggable credibility system
+        band = None
+        if regime_spec and 'band' in regime_spec:
+            band = _resolve_param_value(regime_spec['band'], base_params)
+        switching_fn = build_credibility_switching_fn(
+            cred_compiled, parsed['var_names'], base_params, band=band)
+    else:
+        # Fall back to old hardcoded switching
+        switching_fn = build_switching_fn(regime_spec, parsed['var_names'])
 
     info = {
         'var_names': parsed['var_names'],
@@ -1146,6 +1455,9 @@ def evaluate_two_regime_model(compiled, param_overrides=None):
         'params_M1': params_M1,
         'params_M2': params_M2,
     }
+
+    if cred_compiled is not None:
+        info['credibility_compiled'] = cred_compiled
 
     return matrices_M1, matrices_M2, switching_fn, info
 

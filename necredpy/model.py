@@ -25,6 +25,7 @@ from necredpy.utils.dynare_parser import (
     parse_two_regime_model, get_model_matrices, build_switching_fn,
     compile_two_regime_model, evaluate_two_regime_model,
     extract_priors, build_numpyro_prior_fn,
+    build_credibility_switching_fn,
 )
 
 
@@ -47,7 +48,7 @@ class Model:
 
         # Compile once (expensive sympy step)
         self._compiled = compile_two_regime_model(self._mod_string)
-        self._regime_spec = self._compiled['regime_spec_raw']
+        self._regime_spec = self._compiled.get('regime_spec_raw')
         parsed = self._compiled['parsed']
 
         self.var_names = parsed['var_names']
@@ -135,10 +136,20 @@ class Model:
             return df
 
         # Piecewise-linear with credibility switching
-        regime_spec = copy.deepcopy(info['regime_spec'])
-        if cred_init is not None:
-            regime_spec['cred_init'] = cred_init
-        sw = build_switching_fn(regime_spec, vn)
+        cred_compiled = info.get('credibility_compiled')
+        if cred_compiled is not None:
+            if cred_init is not None:
+                cred_compiled = copy.deepcopy(cred_compiled)
+                cred_compiled['cred_init'] = cred_init
+            regime_spec = info.get('regime_spec', {})
+            band = regime_spec.get('band') if regime_spec else None
+            sw = build_credibility_switching_fn(
+                cred_compiled, vn, info['params_M1'], band=band)
+        else:
+            regime_spec = copy.deepcopy(info['regime_spec'])
+            if cred_init is not None:
+                regime_spec['cred_init'] = cred_init
+            sw = build_switching_fn(regime_spec, vn)
 
         u, reg, _, _, _, conv, iters = solve_endogenous(
             self._M1, self._M2, sw, eps, T)
@@ -226,10 +237,20 @@ class Model:
             )
             return pd.DataFrame(u, columns=vn)
 
-        regime_spec = copy.deepcopy(info['regime_spec'])
-        if cred_init is not None:
-            regime_spec['cred_init'] = cred_init
-        sw = build_switching_fn(regime_spec, vn)
+        cred_compiled = info.get('credibility_compiled')
+        if cred_compiled is not None:
+            if cred_init is not None:
+                cred_compiled = copy.deepcopy(cred_compiled)
+                cred_compiled['cred_init'] = cred_init
+            regime_spec = info.get('regime_spec', {})
+            band = regime_spec.get('band') if regime_spec else None
+            sw = build_credibility_switching_fn(
+                cred_compiled, vn, info['params_M1'], band=band)
+        else:
+            regime_spec = copy.deepcopy(info['regime_spec'])
+            if cred_init is not None:
+                regime_spec['cred_init'] = cred_init
+            sw = build_switching_fn(regime_spec, vn)
 
         u, reg, _, _, _, conv, iters = solve_endogenous(
             self._M1, self._M2, sw, eps, T)

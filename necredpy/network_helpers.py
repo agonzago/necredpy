@@ -61,7 +61,8 @@ import numpy as np
 
 from necredpy.pontus import solve_terminal, solve_endogenous, simulate_forward
 from necredpy.utils.dynare_parser import (parse_two_regime_model, get_model_matrices,
-                                           build_switching_fn)
+                                           build_switching_fn,
+                                           build_credibility_switching_fn)
 
 
 # Display names and colors for the 5 sectors defined in the .mod file.
@@ -193,10 +194,19 @@ def solve_pl(M1, M2, mod_string, shock_name, shock_size, info,
         Whether the endogenous switching converged.
     """
     if cred_init is not None:
-        # Build a switching function with a custom initial credibility
-        spec = copy.deepcopy(info['regime_spec'])
-        spec['cred_init'] = cred_init
-        sw = build_switching_fn(spec, info['var_names'])
+        # Check if we have a pluggable credibility specification
+        if 'credibility_compiled' in info:
+            import copy as _copy
+            cred_compiled = _copy.deepcopy(info['credibility_compiled'])
+            cred_compiled['cred_init'] = cred_init
+            sw = build_credibility_switching_fn(
+                cred_compiled, info['var_names'],
+                info.get('params_M1', {}),
+                band=info['regime_spec'].get('band'))
+        else:
+            spec = copy.deepcopy(info['regime_spec'])
+            spec['cred_init'] = cred_init
+            sw = build_switching_fn(spec, info['var_names'])
     else:
         # Parse fresh switching function (each solve needs its own,
         # because the switching function carries internal cred state)
@@ -260,9 +270,18 @@ def find_threshold(M1, M2, mod_string, info, shock_name, T=60,
     for _ in range(30):
         mid = (lo + hi) / 2.0
         if cred_init is not None:
-            spec = copy.deepcopy(info['regime_spec'])
-            spec['cred_init'] = cred_init
-            sw = build_switching_fn(spec, vn)
+            if 'credibility_compiled' in info:
+                import copy as _copy
+                cred_compiled = _copy.deepcopy(info['credibility_compiled'])
+                cred_compiled['cred_init'] = cred_init
+                sw = build_credibility_switching_fn(
+                    cred_compiled, vn,
+                    info.get('params_M1', {}),
+                    band=info['regime_spec'].get('band'))
+            else:
+                spec = copy.deepcopy(info['regime_spec'])
+                spec['cred_init'] = cred_init
+                sw = build_switching_fn(spec, vn)
         else:
             _, _, sw, _ = parse_two_regime_model(mod_string)
         eps = np.zeros((T, n))
