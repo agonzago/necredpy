@@ -105,13 +105,37 @@ The model has two regimes:
 - **M1 (high credibility):** Phillips curves are forward-looking (weight `omega_H`)
 - **M2 (low credibility):** Phillips curves are backward-looking (weight `omega_L`)
 
-Credibility is a stock variable that evolves each period:
+### Credibility dynamics
+
+Credibility is a stock variable that evolves each period. The library supports two ways to specify how it evolves:
+
+**1. Built-in Isard specification** (via `regimes;` block):
 ```
 miss_t = 1{|pi_t| > epsilon_bar}
 cred_t = cred_{t-1} + delta_up * (1 - cred_{t-1}) * (1 - miss_t)
                      - delta_down * cred_{t-1} * miss_t
 ```
-When `cred_t < cred_threshold`, the economy switches to M2. Credibility depletes fast (`delta_down = 0.70`) and rebuilds slowly (`delta_up = 0.05`).
+
+**2. User-defined specification** (via `credibility;` block):
+```
+credibility;
+  monitor:   pi_agg;
+  threshold: 0.5;
+  cred_init: 1.0;
+  signal = exp(-omega_1 - omega_2*(pi(-1) - pi_star)^2) - omega_3;
+  accumulation = psi*cred + (1-psi)*s;
+end;
+```
+
+The `credibility;` block lets you write arbitrary signal and accumulation functions as mathematical expressions. They are parsed by sympy and compiled to both numpy (for the PL solver) and JAX (for Bayesian estimation). Any parameter declared in the `parameters` block can appear in these expressions and can be estimated via the `priors;` block.
+
+Available symbols in `signal`: `pi` (current monitored variable), `pi(-1)` (lagged), `pi_star` (target), and any declared parameter. Available symbols in `accumulation`: `cred` (previous stock), `s` (current signal), `miss` (band indicator), and any declared parameter. Standard math functions are supported: `exp`, `log`, `sqrt`, `abs`.
+
+When both blocks are present, `credibility;` takes precedence for switching dynamics while `regimes;` still provides the M1/M2 parameter overrides.
+
+When `cred_t < threshold`, the economy switches to M2.
+
+### Solver
 
 The **PL solver** iterates:
 1. Solve the terminal regime: `CF^2 + BF + A = 0` (structured doubling)
@@ -119,7 +143,7 @@ The **PL solver** iterates:
 3. Forward simulation: `u_t = E_t + F_t u_{t-1} + Q_t epsilon_t`
 4. Update the regime sequence from the simulated path; repeat until consistent
 
-For **estimation**, a sigmoid approximation (`tau` parameter) smooths the credibility threshold, making the likelihood differentiable for HMC/NUTS.
+For **estimation**, a sigmoid approximation (`tau` parameter) smooths the credibility threshold, making the likelihood differentiable for HMC/NUTS. When using a `credibility;` block, the signal and accumulation functions are compiled to JAX-traced callables, so they are fully differentiable without additional smoothing.
 
 ## Dynare `.mod` files
 
@@ -128,10 +152,43 @@ Models are defined in Dynare-compatible `.mod` files in the `dynare/` directory.
 | File | Description |
 |------|-------------|
 | `credibility_nk.mod` | 3-equation NK model (3 variables, 3 shocks) |
-| `credibility_nk_regimes.mod` | Same model with regime specification and priors for estimation |
+| `credibility_nk_regimes.mod` | Same model with Isard credibility and priors for estimation |
+| `credibility_nk_banrep.mod` | Same model with BanRep Gaussian credibility (`credibility;` block) |
 | `five_sector_network.mod` | 5-sector QPM with I-O linkages (27 variables, 12 shocks) |
+| `five_sector_banrep_cred.mod` | 5-sector model with BanRep Gaussian credibility |
 | `five_sector_est.mod` | 5-sector model configured for estimation (8 observables, 8 shocks) |
 | `two_sector_*.mod` | 2-sector variants |
+
+### Credibility specification in `.mod` files
+
+Credibility dynamics can be specified in two ways. The `regimes;` block uses the built-in Isard indicator-function specification:
+
+```
+regimes;
+  M1: omega = omega_H;
+  M2: omega = omega_L;
+  switch: shadow_cred;
+  monitor: pi_agg;
+  band: epsilon_bar;
+  delta_up: delta_up;
+  delta_down: delta_down;
+  cred_init: 1.0;
+end;
+```
+
+The `credibility;` block allows arbitrary user-defined signal and accumulation functions:
+
+```
+credibility;
+  monitor:   pi_agg;
+  threshold: 0.5;
+  cred_init: 1.0;
+  signal = exp(-omega_sig_ub - omega_sig1*(pi(-1) - pi_star)^2) - omega_sig3;
+  accumulation = psi_cred*cred + (1-psi_cred)*s;
+end;
+```
+
+Both blocks can coexist in the same file. The `credibility;` block takes precedence for switching dynamics, while `regimes;` provides the M1/M2 parameter overrides.
 
 ### Priors in `.mod` files
 
@@ -145,7 +202,7 @@ priors;
 end;
 ```
 
-The parser converts (mean, std) to proper shape parameters for beta/gamma/inv_gamma distributions and builds NumPyro sampling functions automatically.
+The parser converts (mean, std) to proper shape parameters for beta/gamma/inv_gamma distributions and builds NumPyro sampling functions automatically. Credibility parameters used in the `credibility;` block (e.g., `psi_cred`, `omega_sig1`) can be included in the priors for joint estimation.
 
 ## Examples
 
