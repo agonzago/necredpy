@@ -313,6 +313,9 @@ class Model:
         import numpyro
         from numpyro.infer import MCMC, NUTS
 
+        if num_chains > 1:
+            numpyro.set_host_device_count(num_chains)
+
         from necredpy.jax_model import (
             compile_jax_model, inversion_filter_partial, solve_terminal_jax,
         )
