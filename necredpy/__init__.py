@@ -38,3 +38,14 @@ from necredpy.utils.dynare_parser import (
 )
 
 from necredpy.model import Model
+
+from necredpy.credibility_stock import (
+    kalman_filter,
+    kalman_smoother,
+    bomfim_rudebusch,
+    gaussian_signal,
+    credibility_stock_ar1,
+    fit_signal_regression,
+    cecchetti_index,
+    expectations_gap,
+)
