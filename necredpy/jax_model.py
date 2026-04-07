@@ -57,8 +57,8 @@ def solve_terminal_jax(A, B, C, n_iter=500):
 # ---------------------------------------------------------------------------
 
 def smooth_miss(pi, epsilon_bar, tau):
-    """miss_t = sigmoid((|pi_t| - epsilon_bar) / tau)."""
-    return jax.nn.sigmoid((jnp.abs(pi) - epsilon_bar) / tau)
+    """miss_t = sigmoid((pi_t^2 - epsilon_bar^2) / tau)."""
+    return jax.nn.sigmoid((pi**2 - epsilon_bar**2) / tau)
 
 
 def credibility_step(cred, pi_t, epsilon_bar, tau, delta_up, delta_down):
@@ -216,8 +216,8 @@ def _build_cred_scan_fn(model, params):
         def cred_scan_fn(carry, pi_t):
             cred, pi_lag = carry
 
-            # Smooth miss indicator (always available for accumulation)
-            miss = jax.nn.sigmoid((jnp.abs(pi_t) - epsilon_bar) / tau)
+            # Smooth miss indicator (squared deviation: everywhere differentiable)
+            miss = jax.nn.sigmoid((pi_t**2 - epsilon_bar**2) / tau)
 
             # Signal
             if signal_fn is not None:
