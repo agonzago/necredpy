@@ -423,6 +423,10 @@ def compile_jax_model(mod_string, verbose=False):
         'credibility_jax': credibility_jax,
         'aux_resolution': jax_funcs.get('aux_resolution', {}),
         'monitor_resolution': jax_funcs.get('monitor_resolution', {}),
+        # Model-block options parsed from `model(...)`. nocredibility=True
+        # means downstream code should treat the model as fully linear with
+        # cred==1, omega==1 and skip any credibility scan.
+        'model_options': jax_funcs.get('model_options', {}),
     }
 
 

@@ -229,6 +229,10 @@ def update_credibility(monitor_lag, cred_lag, model, params):
     .mod file may use the lagged monitor (BE 1304 default) or the
     contemporaneous one; the parser tracks this via signal_lag.
 
+    Models declared with `model(nocredibility);` short-circuit this
+    function: cred is fixed at 1.0 and omega at params['omega'] (or
+    1.0 if absent). The lagged monitor and cred_lag are ignored.
+
     Parameters
     ----------
     monitor_lag : scalar
@@ -246,6 +250,13 @@ def update_credibility(monitor_lag, cred_lag, model, params):
         Credibility-scaled forward weight,
         omega_t = omega_L + (omega_H - omega_L) * cred_t.
     """
+    if model.get("credibility_jax") is None:
+        # No credibility regime in the model. Treat as fully linear:
+        # cred is constant 1, omega is the constant value in params
+        # (or 1.0 if the model has no omega parameter at all).
+        omega_const = float(params.get("omega", 1.0))
+        return jnp.array(1.0), jnp.array(omega_const)
+
     from necredpy.jax_model import _build_cred_scan_fn
 
     cred_scan_fn, _ = _build_cred_scan_fn(model, params)

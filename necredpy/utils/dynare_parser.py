@@ -108,29 +108,59 @@ def extract_declarations(mod_string):
 
 
 def extract_model_equations(mod_string):
-    """Extract equations from the model; ... end; block.
+    """Extract equations and options from the model; ... end; block.
 
     Each equation 'LHS = RHS' is converted to '(LHS) - (RHS)' so the
     zero-residual form F(...) = 0 is used for Jacobian computation.
 
+    Recognised model-block options (Dynare-style, comma-separated inside
+    the parentheses after `model`):
+
+      linear         : informational only -- the parser already builds
+                       linear matrices via symbolic differentiation, so
+                       this flag is accepted for compatibility but does
+                       not change behaviour.
+      nocredibility  : declares that the model does NOT have a
+                       credibility/regimes block. Downstream code that
+                       would normally require one (compile_two_regime_model,
+                       nn_solver.update_credibility, ...) will treat the
+                       model as fully linear with cred==1, omega==1.
+
     Returns
     -------
     equations : list of str
+    options : dict
+        Parsed model-block options. Currently:
+            {'nocredibility': bool, 'linear': bool}
     """
     processed = re.sub(r'/\*.*?\*/', '', mod_string, flags=re.DOTALL)
     lines = processed.split('\n')
     cleaned = [re.sub(r'(//|%).*$', '', line).strip() for line in lines]
     processed = " ".join(cleaned)
 
-    # Handle model; and model(linear); variants
+    # Capture the options-list (if any) AND the body together so we can
+    # parse the flags inside the parens.
     model_match = re.search(
-        r'(?i)\bmodel\b\s*(?:\([^)]*\))?\s*;(.*?)\bend\b\s*;',
+        r'(?i)\bmodel\b\s*(?:\(([^)]*)\))?\s*;(.*?)\bend\b\s*;',
         processed, re.DOTALL
     )
     if not model_match:
         raise ValueError("Could not find 'model; ... end;' block.")
 
-    model_content = model_match.group(1)
+    options_str = (model_match.group(1) or "").strip()
+    model_content = model_match.group(2)
+
+    # Parse comma-separated options inside model(...).
+    options = {'linear': False, 'nocredibility': False}
+    if options_str:
+        for tok in options_str.split(','):
+            tok = tok.strip().lower()
+            if not tok:
+                continue
+            if tok in options:
+                options[tok] = True
+            # Unknown options are silently ignored for forward-compat.
+
     raw_equations = [eq.strip() for eq in model_content.split(';') if eq.strip()]
 
     equations = []
@@ -142,7 +172,7 @@ def extract_model_equations(mod_string):
         else:
             equations.append(line)
 
-    return equations
+    return equations, options
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +309,8 @@ def parse_mod(mod_string, verbose=False):
         print(f"Shocks ({len(shock_names)}): {shock_names}")
         print(f"Parameters ({len(param_names)}): {param_names}")
 
-    # --- Step 2: Parse equations ---
-    raw_equations = extract_model_equations(mod_string)
+    # --- Step 2: Parse equations and model-block options ---
+    raw_equations, model_options = extract_model_equations(mod_string)
 
     # --- Step 2b: Expand lags/leads > 1 via auxiliary variables ---
     # For lags: x(-k) becomes a chain aux_x_lag_m{j} = prev(-1) for j=1..k-1,
@@ -655,6 +685,11 @@ def parse_mod(mod_string, verbose=False):
         'shock_names': shock_names,
         'param_names': param_names,
         'param_defaults': param_defaults,
+        # Model-block options parsed from `model(...)`. Currently:
+        #   nocredibility -- declares that the model has no credibility
+        #                    block; downstream code (compile_two_regime_model,
+        #                    nn_solver) treats it as fully linear.
+        'model_options': model_options,
         # Aux and identity resolution (used by inversion filter to look up
         # monitor variables that are not directly observed).
         'aux_resolution': aux_resolution,
@@ -707,6 +742,7 @@ def jax_lambdify(parsed):
         'param_defaults': parsed['param_defaults'],
         'aux_resolution': parsed.get('aux_resolution', {}),
         'monitor_resolution': parsed.get('monitor_resolution', {}),
+        'model_options': parsed.get('model_options', {}),
     }
 
 
@@ -1641,17 +1677,20 @@ def compile_two_regime_model(mod_string, verbose=False):
     regime_spec_raw = extract_regimes(mod_string)
     cred_spec = extract_credibility(mod_string)
 
-    if regime_spec_raw is None and cred_spec is None:
-        raise ValueError(
-            "No 'regimes; ... end;' or 'credibility; ... end;' "
-            "block found in .mod file.")
-
     parsed = parse_mod(mod_string, verbose=verbose)
+    nocred = parsed.get('model_options', {}).get('nocredibility', False)
+
+    if regime_spec_raw is None and cred_spec is None and not nocred:
+        raise ValueError(
+            "No 'regimes; ... end;' or 'credibility; ... end;' block found "
+            "in .mod file. If this model is intentionally linear with no "
+            "credibility regime, declare it with 'model(nocredibility);'.")
 
     result = {
         'parsed': parsed,
         'regime_spec_raw': regime_spec_raw,
         'credibility_spec': cred_spec,
+        'nocredibility': nocred,
     }
 
     # Pre-compile credibility expressions (expensive sympy step)
@@ -1661,6 +1700,8 @@ def compile_two_regime_model(mod_string, verbose=False):
             parsed['param_names'],
             parsed['param_defaults'],
         )
+    else:
+        result['credibility_compiled'] = None
 
     return result
 
@@ -1698,12 +1739,20 @@ def evaluate_two_regime_model(compiled, param_overrides=None):
     if param_overrides:
         base_params.update(param_overrides)
 
+    nocred = compiled.get('nocredibility', False)
+
     if regime_spec is None:
-        # No regimes; block. Build a minimal regime_spec from parameters.
-        regime_spec = {
-            'M1_params': {'omega': base_params.get('omega_H', 0.65)},
-            'M2_params': {'omega': base_params.get('omega_L', 0.35)},
-        }
+        if nocred:
+            # nocredibility model: single-regime, no parameter overrides.
+            # M1 == M2 == the base parameter set; the switching function
+            # will return all-zeros (always M1).
+            regime_spec = {'M1_params': {}, 'M2_params': {}}
+        else:
+            # Legacy fallback: derive omega_H/omega_L from defaults.
+            regime_spec = {
+                'M1_params': {'omega': base_params.get('omega_H', 0.65)},
+                'M2_params': {'omega': base_params.get('omega_L', 0.35)},
+            }
 
     # Resolve regime-specific parameter overrides
     params_M1 = dict(base_params)
@@ -1764,6 +1813,13 @@ def evaluate_two_regime_model(compiled, param_overrides=None):
             band = _resolve_param_value(regime_spec['band'], base_params)
         switching_fn = build_credibility_switching_fn(
             cred_compiled, parsed['var_names'], base_params, band=band)
+    elif nocred:
+        # nocredibility model: trivial switching function. M1 == M2,
+        # so the regime sequence is irrelevant -- always return M1.
+        def switching_fn(u_path):
+            return np.zeros(u_path.shape[0], dtype=int)
+        switching_fn.cred_path = None
+        switching_fn.signal_path = None
     else:
         # Fall back to old hardcoded switching
         switching_fn = build_switching_fn(regime_spec, parsed['var_names'])
