@@ -149,6 +149,105 @@ def extract_model_equations(mod_string):
 # Symbolic Jacobian computation
 # ---------------------------------------------------------------------------
 
+def _expand_aux_variables(raw_equations, var_names, shock_names, verbose=False):
+    """Expand lags/leads of order > 1 by adding auxiliary variables.
+
+    See docstring elsewhere. In addition to expanding, returns an
+    `aux_resolution` map: {aux_name: (base_var, total_lag)} so that any
+    auxiliary can be resolved back to its source variable at the right lag.
+    For example, aux_pi_cpi_lag_m2 -> ('pi_cpi', -2).
+
+    Returns
+    -------
+    expanded_equations : list of str
+    expanded_var_names : list of str
+    aux_vars_added : list of str
+    aux_resolution : dict {aux_name: (base_name, lag)}
+    """
+    var_time_regex = re.compile(r'\b([a-zA-Z_]\w*)\s*\(\s*([+-]?\d+)\s*\)')
+
+    # Work on copies
+    expanded_equations = list(raw_equations)
+    expanded_var_names = list(var_names)
+    aux_vars_added = []           # track order of insertion
+    aux_definitions = {}          # aux_name -> definition equation string
+    aux_resolution = {}           # aux_name -> (base_name, total_lag)
+    endogenous_set = set(var_names)
+    shock_set = set(shock_names)
+
+    def _ensure_aux_chain(base_name, shift):
+        """Create (if needed) the chain of aux variables for base_name(shift).
+
+        For shift = -k (k >= 2), builds the chain:
+            aux_<base>_lag_m1 = base(-1)        (represents base(-1) at time t)
+            aux_<base>_lag_m2 = aux_<base>_lag_m1(-1)  (represents base(-2) at time t)
+            ...
+            aux_<base>_lag_m{k-1} = aux_<base>_lag_m{k-2}(-1)
+        and returns the name of the tail aux variable (here `aux_<base>_lag_m{k-1}`).
+        The caller then substitutes `base(-k)` with `aux_<base>_lag_m{k-1}(-1)`.
+
+        Analogously for leads (shift = +k).
+        """
+        k = abs(shift)
+        if k < 2:
+            return None
+        is_lag = shift < 0
+        tag = 'lag_m' if is_lag else 'lead_p'
+        chain_step = '(-1)' if is_lag else '(+1)'
+        sign = -1 if is_lag else +1
+
+        for j in range(1, k):  # j = 1 .. k-1
+            aux_name = f"aux_{base_name}_{tag}{j}"
+            if aux_name in aux_definitions:
+                continue
+            prev = base_name if j == 1 else f"aux_{base_name}_{tag}{j-1}"
+            def_eq = f"{aux_name} - {prev}{chain_step}"
+            aux_definitions[aux_name] = def_eq
+            aux_vars_added.append(aux_name)
+            # aux_<base>_lag_m{j} at time t represents base(-j)
+            aux_resolution[aux_name] = (base_name, sign * j)
+            if aux_name not in endogenous_set:
+                expanded_var_names.append(aux_name)
+                endogenous_set.add(aux_name)
+            expanded_equations.append(def_eq)
+
+        return f"aux_{base_name}_{tag}{k-1}"
+
+    # Walk each original equation and substitute every x(-k)/x(+k) with
+    # k >= 2 by the corresponding CHAIN TAIL aux variable referenced at
+    # (-1) or (+1). For k == 1 references, leave them alone (the parser
+    # natively handles single-step shifts via the A/C matrices).
+    #
+    # Substitution: x(-3) -> aux_x_lag_m2(-1)
+    # Aux chain:    aux_x_lag_m1 = x(-1)
+    #               aux_x_lag_m2 = aux_x_lag_m1(-1)     (= x(-2))
+    #
+    # This matches the qpm_toolbox convention: substitutions stay as
+    # (-1) references so existing A/B/C Jacobians work unchanged.
+    n_original = len(raw_equations)
+    for i in range(n_original):
+        eq = expanded_equations[i]
+        matches = list(var_time_regex.finditer(eq))
+        modified = eq
+        for match in reversed(matches):
+            base_name = match.group(1)
+            shift = int(match.group(2))
+            if base_name in shock_set:
+                continue
+            if base_name not in endogenous_set:
+                continue
+            if abs(shift) <= 1:
+                continue
+            aux_name = _ensure_aux_chain(base_name, shift)
+            chain_step = '(-1)' if shift < 0 else '(+1)'
+            replacement = f"{aux_name}{chain_step}"
+            start, end = match.span()
+            modified = modified[:start] + replacement + modified[end:]
+        expanded_equations[i] = modified
+
+    return expanded_equations, expanded_var_names, aux_vars_added, aux_resolution
+
+
 def parse_mod(mod_string, verbose=False):
     """Parse a .mod file and return lambdified matrix functions.
 
@@ -182,6 +281,21 @@ def parse_mod(mod_string, verbose=False):
 
     # --- Step 2: Parse equations ---
     raw_equations = extract_model_equations(mod_string)
+
+    # --- Step 2b: Expand lags/leads > 1 via auxiliary variables ---
+    # For lags: x(-k) becomes a chain aux_x_lag_m{j} = prev(-1) for j=1..k-1,
+    # and the original term is replaced by aux_x_lag_m{k-1}(-1).
+    # For leads: x(+k) similarly with aux_x_lead_p{j}.
+    # Auxiliary variable definitions are appended to the equation list so
+    # the system remains square.
+    raw_equations, var_names, aux_vars_added, aux_resolution = _expand_aux_variables(
+        raw_equations, var_names, shock_names, verbose=verbose)
+    if verbose and aux_vars_added:
+        print(f"Added {len(aux_vars_added)} auxiliary variables for lags/leads > 1:")
+        for aux in aux_vars_added:
+            base, lag = aux_resolution[aux]
+            print(f"  {aux}  represents  {base}({lag:+d})")
+
     num_vars = len(var_names)
     num_eq = len(raw_equations)
     num_shocks = len(shock_names)
@@ -309,6 +423,208 @@ def parse_mod(mod_string, verbose=False):
         print("Symbolic C (lead):\n", sympy_C)
         print("Symbolic D (shocks):\n", sympy_D)
 
+    # --- Step 4a: Reorder equation rows to match var_names ---
+    # The .mod file can declare variables in one order and write equations
+    # in a different order. Downstream filter code assumes ROW i of the
+    # Jacobian matrices corresponds to the equation that OWNS var_names[i]
+    # (i.e., the equation in which var_names[i] appears on the LHS of "=").
+    # We identify equation owners from the raw equation strings and build
+    # a permutation that places each owner-equation at the row of its
+    # owned variable.
+    _lhs_re = re.compile(r'^\s*\(\s*([A-Za-z_]\w*)\s*\)\s*-')
+    _aux_re = re.compile(r'^\s*([A-Za-z_]\w*)\s*-')
+    eq_owner_name = [None] * num_eq
+    for i, eq_str in enumerate(raw_equations):
+        m = _lhs_re.match(eq_str)
+        if m:
+            eq_owner_name[i] = m.group(1)
+        else:
+            m2 = _aux_re.match(eq_str)
+            if m2:
+                eq_owner_name[i] = m2.group(1)
+
+    # Build permutation: for each variable (in var_names order), find the
+    # equation row that owns it. This gives new_row_index -> old_row_index.
+    var_to_old_eq = {}
+    for old_i, owner in enumerate(eq_owner_name):
+        if owner in var_to_old_eq:
+            # Ambiguous: two equations claim the same owner. Keep the first.
+            continue
+        var_to_old_eq[owner] = old_i
+
+    missing = [v for v in var_names if v not in var_to_old_eq]
+    if missing:
+        if verbose:
+            print(f"Warning: could not identify owner equation for "
+                  f"{len(missing)} variables: {missing[:5]}... "
+                  f"Keeping original equation order.")
+        # Fall back: no reordering. Rows stay as written.
+        permutation = list(range(num_eq))
+    else:
+        permutation = [var_to_old_eq[v] for v in var_names]
+
+    # Apply permutation to sympy matrices (which are indexed by eq row).
+    # This happens ONCE at parse time on symbolic matrices. After
+    # lambdification, build_ABC returns pre-permuted matrices at every
+    # call, so the filter never re-permutes at runtime.
+    #
+    # Skip the work if the permutation is already the identity (a
+    # well-written .mod file with eq order matching var_names order).
+    if permutation != list(range(num_eq)):
+        sympy_A = sympy.Matrix([sympy_A.row(old_i) for old_i in permutation])
+        sympy_B = sympy.Matrix([sympy_B.row(old_i) for old_i in permutation])
+        sympy_C = sympy.Matrix([sympy_C.row(old_i) for old_i in permutation])
+        sympy_D = sympy.Matrix([sympy_D.row(old_i) for old_i in permutation])
+        sym_equations = [sym_equations[old_i] for old_i in permutation]
+        raw_equations = [raw_equations[old_i] for old_i in permutation]
+        if verbose:
+            print(f"Reordered {num_eq} equations to match var_names order")
+
+    # --- Step 4b: Build the (var, lag)-dependency graph and monitor_resolution ---
+    #
+    # The A/B/C/D matrices encode a dependency graph:
+    #   nodes     : (variable, relative_lag) pairs
+    #   directed edges : equation that defines `owner` at lag 0 contributes
+    #                    edges  (owner, 0) -> (other_var, lag, coeff)
+    # The "defining equation" of each variable is identified via equation
+    # OWNERSHIP, which we read from the raw equation strings (LHS of "=" for
+    # user equations, first token before "-" for appended aux definitions).
+    #
+    # Only equations with NO shocks, NO leads, and NO lags in any of their
+    # terms can be resolved purely from data. BUT: we can still resolve a
+    # variable whose defining equation contains lags, as long as those lags
+    # are of variables that can themselves be resolved (recursively).
+    #
+    # The resolution is a DFS walk of the graph. We stop at "sink" nodes:
+    # source variables (non-identity, non-aux) whose value is presumed to
+    # be read from observations. We collapse the walk into a flat list of
+    # (source_var, lag, coeff) tuples.
+    import networkx as nx
+
+    # Identify equation owners: equation row index -> variable it "defines".
+    # User equations have been transformed to the form "(LHS) - (RHS)" by
+    # extract_model_equations(). Aux definition equations (appended by
+    # _expand_aux_variables) have the form "aux_name - prev_term".
+    user_eq_re = re.compile(r'^\s*\(\s*([A-Za-z_]\w*)\s*\)\s*-')
+    aux_def_re = re.compile(r'^\s*([A-Za-z_]\w*)\s*-')
+
+    eq_owner = {}  # eq_row_index -> var_name
+    for i, eq_str in enumerate(raw_equations):
+        m = user_eq_re.match(eq_str)
+        if m:
+            candidate = m.group(1)
+        else:
+            m2 = aux_def_re.match(eq_str)
+            candidate = m2.group(1) if m2 else None
+        if candidate and candidate in var_names:
+            eq_owner[i] = candidate
+
+    # Build a directed graph: owner -> (dep_var, lag, weight).
+    # We skip equations with SHOCKS (can't be resolved from data) and
+    # equations with LEADS (forward-looking, not a pure definition).
+    # Equations with lags ARE allowed — we'll resolve the lagged vars
+    # recursively. Aux definitions (which have exactly one lag term)
+    # are handled specially via the `aux_resolution` map to avoid
+    # circular graph walks.
+    dep_graph = nx.MultiDiGraph()
+
+    for eq_i, owner in eq_owner.items():
+        # Skip if this equation has a shock: the owner is not resolvable
+        # from data alone. Parameter-dependent coefficients are OK.
+        if any(sympy_D[eq_i, k] != 0 for k in range(num_shocks)):
+            continue
+        # Skip if the equation has any forward expectation.
+        if any(sympy_C[eq_i, k] != 0 for k in range(num_vars)):
+            continue
+        # Skip aux definitions -- those are handled by aux_resolution.
+        if owner in aux_resolution:
+            continue
+        j = var_names.index(owner)
+        b_jj = sympy_B[eq_i, j]
+        if b_jj == 0:
+            continue
+        # Collect dependencies: contemporaneous (lag 0) from B, lagged
+        # (lag -1) from A. Skip self-reference at lag 0.
+        for k in range(num_vars):
+            if k == j:
+                continue
+            coeff = sympy_B[eq_i, k]
+            if coeff == 0:
+                continue
+            try:
+                w = float(-coeff / b_jj)
+            except (TypeError, ValueError):
+                w = None  # parameter-dependent; unresolvable
+            dep_graph.add_edge(owner, var_names[k], lag=0, weight=w)
+        for k in range(num_vars):
+            coeff = sympy_A[eq_i, k]
+            if coeff == 0:
+                continue
+            try:
+                w = float(-coeff / b_jj)
+            except (TypeError, ValueError):
+                w = None
+            dep_graph.add_edge(owner, var_names[k], lag=-1, weight=w)
+
+    if verbose:
+        print(f"Dependency graph: {dep_graph.number_of_nodes()} nodes, "
+              f"{dep_graph.number_of_edges()} edges")
+
+    # Resolution: walk the graph depth-first from a query variable,
+    # accumulating lag offsets and coefficient products. Aux variables
+    # are substituted via aux_resolution. A variable is "fully resolvable"
+    # only if EVERY edge encountered in its walk has a numeric weight
+    # and every terminal node is a source (non-identity, non-aux). If the
+    # walk hits a parameter-dependent edge or exceeds depth, the whole
+    # variable is declared unresolvable (no entry in monitor_resolution).
+    class _Unresolvable(Exception):
+        pass
+
+    def _resolve_graph(var_name, lag_acc, coeff_acc, out_terms, depth=0):
+        if depth > 30:
+            raise _Unresolvable(f"depth > 30 at {var_name}")
+        if var_name in aux_resolution:
+            base, aux_lag = aux_resolution[var_name]
+            _resolve_graph(base, lag_acc + aux_lag, coeff_acc,
+                           out_terms, depth + 1)
+            return
+        if var_name not in dep_graph or dep_graph.out_degree(var_name) == 0:
+            # Source variable -- emit the accumulated term.
+            out_terms.append((var_name, lag_acc, coeff_acc))
+            return
+        for _, neighbor, data in dep_graph.out_edges(var_name, data=True):
+            w = data.get('weight')
+            if w is None:
+                raise _Unresolvable(f"param edge at {var_name}->{neighbor}")
+            edge_lag = data.get('lag', 0)
+            _resolve_graph(neighbor, lag_acc + edge_lag, coeff_acc * w,
+                           out_terms, depth + 1)
+
+    # Build monitor_resolution map for every variable that has a defining
+    # equation (i.e., is a node in dep_graph with outgoing edges).
+    monitor_resolution = {}
+    for var in dep_graph.nodes():
+        if dep_graph.out_degree(var) == 0:
+            continue
+        raw_terms = []
+        try:
+            _resolve_graph(var, 0, 1.0, raw_terms)
+        except _Unresolvable:
+            continue  # silently skip; not all variables are data-computable
+        collapsed = {}
+        for src, lag, c in raw_terms:
+            collapsed[(src, lag)] = collapsed.get((src, lag), 0.0) + c
+        entries = [(src, lag, c) for (src, lag), c in collapsed.items()
+                   if abs(c) > 1e-14]
+        monitor_resolution[var] = entries
+
+    if verbose and monitor_resolution:
+        print(f"monitor_resolution ({len(monitor_resolution)} variables "
+              "resolved to observables):")
+        for v, entries in monitor_resolution.items():
+            desc = " + ".join(f"{c:.4g}*{src}({lag:+d})" for src, lag, c in entries)
+            print(f"  {v} = {desc}")
+
     # --- Step 5: Extract constant terms ---
     # D_const[i] = F_i evaluated at all variables = 0 and all shocks = 0
     # For models linearized around SS this is zero; for regime-dependent SS
@@ -339,6 +655,10 @@ def parse_mod(mod_string, verbose=False):
         'shock_names': shock_names,
         'param_names': param_names,
         'param_defaults': param_defaults,
+        # Aux and identity resolution (used by inversion filter to look up
+        # monitor variables that are not directly observed).
+        'aux_resolution': aux_resolution,
+        'monitor_resolution': monitor_resolution,
         # Store symbolic matrices for JAX re-lambdification
         '_sympy_A': sympy_A,
         '_sympy_B': sympy_B,
@@ -385,6 +705,8 @@ def jax_lambdify(parsed):
         'var_names': parsed['var_names'],
         'shock_names': parsed['shock_names'],
         'param_defaults': parsed['param_defaults'],
+        'aux_resolution': parsed.get('aux_resolution', {}),
+        'monitor_resolution': parsed.get('monitor_resolution', {}),
     }
 
 
