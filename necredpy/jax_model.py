@@ -361,6 +361,8 @@ def compile_jax_model(mod_string, verbose=False):
     func_A = jax_funcs['func_A']
     func_B = jax_funcs['func_B']
     func_C = jax_funcs['func_C']
+    func_D = jax_funcs.get('func_D')
+    func_D_const = jax_funcs.get('func_D_const')
 
     def build_ABC(params_dict):
         """Build A, B, C matrices from a parameter dictionary.
@@ -373,6 +375,30 @@ def compile_jax_model(mod_string, verbose=False):
         C = func_C(*args)
         return A, B, C
 
+    def build_D(params_dict):
+        """Shock selection matrix D of shape (n_eq, n_shocks).
+
+        Coefficient of e(t) in equation row i. Used by the NN solver to
+        advance the state with shock realizations:
+            u_t[shock_eqs] = ... + D @ eps_t
+        and elsewhere by the Q calculation in the inversion filter
+        (Q = -(B + CF)^{-1}, with shock columns selected via D).
+        """
+        args = [params_dict[p] for p in param_names]
+        return func_D(*args)
+
+    def build_D_const(params_dict):
+        """Constant intercept vector of shape (n_eq,).
+
+        Holds non-zero constant terms from each equation (most are zero
+        because the model is linearised around steady state). Useful for
+        the NN solver when forming residuals.
+        """
+        if func_D_const is None:
+            return jnp.zeros(n_vars)
+        args = [params_dict[p] for p in param_names]
+        return func_D_const(*args)
+
     regime_spec = extract_regimes(mod_string)
     priors = extract_priors(mod_string)
 
@@ -384,6 +410,8 @@ def compile_jax_model(mod_string, verbose=False):
 
     return {
         'build_ABC': build_ABC,
+        'build_D': build_D,
+        'build_D_const': build_D_const,
         'var_names': var_names,
         'shock_names': shock_names,
         'param_names': param_names,
