@@ -25,45 +25,85 @@ from jax import lax
 # Terminal regime solver (simple iteration, fixed number of steps)
 # ---------------------------------------------------------------------------
 
-def solve_terminal_jax(A, B, C, n_iter=80, tol=1e-10):
-    """Solve CF^2 + BF + A = 0 by simple Pontus iteration.
+def solve_terminal_jax(A, B, C, n_iter=25, tol=1e-12):
+    """Solve CF^2 + BF + A = 0 by structured doubling (cyclic reduction).
 
-    F_{k+1} = -(B + C F_k)^{-1} A
+    Quadratic convergence: each iteration roughly doubles the number of
+    correct bits. ~15 iterations is enough to reach machine precision in
+    float64 for well-conditioned linear DSGEs. Compare to simple Pontus
+    iteration F_{k+1} = -(B + CF_k)^{-1} A which converges linearly and
+    needs many more steps when the spectral radius of F is close to 1.
 
-    Uses lax.scan (differentiable) with a fixed number of iterations and
-    a frozen-update mask: once ||F_{k+1} - F_k||_inf < tol, subsequent
-    iterations stop updating F (the body still runs but the result is
-    masked). This gives most of the early-stop savings while remaining
-    compatible with reverse-mode autodiff (which lax.while_loop is not).
+    Algorithm (Anderson 1978; see also numpy reference at
+    necredpy/pontus.py:solve_terminal_doubling):
 
-    The default n_iter is reduced from 500 to 80, which is enough for
-    well-conditioned linear DSGEs (typical convergence in 10-30 steps).
+        A0 = A;  Ak = A;  Bk = B;  Ck = C;  B_hat = B
+        for k = 1, 2, ...:
+            Gk      = inv(Bk)
+            Ak_new  = -Ak Gk Ak
+            Ck_new  = -Ck Gk Ck
+            Bk_new  = Bk - Ak Gk Ck - Ck Gk Ak
+            B_hat  -= Ck Gk Ak
+            stop when ||Ak_new|| < tol
+        F = -solve(B_hat, A0)
+
+    Implementation details:
+      - Uses lax.scan with a frozen-update mask, so the iteration is
+        differentiable through reverse-mode autodiff (lax.while_loop is
+        not). Once ||Ak|| < tol, all updates are masked off.
+      - Solves Bk Gk = I via lu_factor + lu_solve once, then reuses the
+        factorization (3 solves with 1 factor).
+      - The returned F is exact when iteration converges. When the
+        model is non-stationary the iteration does NOT converge --
+        ||Ak|| stays large, the residual A + BF + CF^2 also stays
+        large, and the caller can detect non-stationarity by checking
+        the QME residual rather than the eigenvalues of the (junk)
+        returned F.
 
     Parameters
     ----------
     A, B, C : jnp.ndarray (n, n)
     n_iter : int
-        Fixed number of iteration steps (gradient-safe upper bound).
+        Maximum doubling iterations (default 25, generous upper bound).
     tol : float
-        Convergence tolerance: once met, F is frozen for subsequent steps.
+        Convergence tolerance on max|Ak|. Once met, all updates freeze.
 
     Returns
     -------
     F : jnp.ndarray (n, n)
     """
     n = A.shape[0]
-    F0 = jnp.zeros((n, n))
+    eye = jnp.eye(n)
+    A0 = A
 
     def step(carry, _):
-        F, frozen = carry
-        F_new = -jnp.linalg.solve(B + C @ F, A)
-        # Once converged, freeze: keep F unchanged on subsequent steps.
-        diff = jnp.max(jnp.abs(F_new - F))
-        new_frozen = frozen | (diff < tol)
-        F_out = jnp.where(new_frozen, F, F_new)
-        return (F_out, new_frozen), None
+        Ak, Bk, Ck, B_hat, frozen = carry
+        # Gk = inv(Bk) via LU (one factor, three reuses)
+        lu, piv = jax.scipy.linalg.lu_factor(Bk)
+        Gk = jax.scipy.linalg.lu_solve((lu, piv), eye)
 
-    (F, _), _ = lax.scan(step, (F0, jnp.array(False)), None, length=n_iter)
+        Ak_new = -Ak @ Gk @ Ak
+        Ck_new = -Ck @ Gk @ Ck
+        Bk_new = Bk - Ak @ Gk @ Ck - Ck @ Gk @ Ak
+        B_hat_new = B_hat - Ck @ Gk @ Ak
+
+        # Convergence: max|Ak_new| below tol
+        new_frozen = frozen | (jnp.max(jnp.abs(Ak_new)) < tol)
+
+        # Freeze updates once converged
+        Ak_out = jnp.where(new_frozen, Ak, Ak_new)
+        Bk_out = jnp.where(new_frozen, Bk, Bk_new)
+        Ck_out = jnp.where(new_frozen, Ck, Ck_new)
+        Bhat_out = jnp.where(new_frozen, B_hat, B_hat_new)
+        return (Ak_out, Bk_out, Ck_out, Bhat_out, new_frozen), None
+
+    init = (A, B, C, B, jnp.array(False))
+    (Ak_final, Bk_final, Ck_final, B_hat_final, _), _ = lax.scan(
+        step, init, None, length=n_iter)
+
+    # Recover F from the converged forward elimination:
+    #   B_hat u_t + A0 u_{t-1} = 0  =>  F = -B_hat^{-1} A0
+    F = -jnp.linalg.solve(B_hat_final, A0)
     return F
 
 
@@ -433,6 +473,21 @@ def inversion_filter(model, obs, params, monitor_index=None):
     A_term, B_term, C_term = build_ABC(params_M1)
     F_terminal = solve_terminal_jax(A_term, B_term, C_term)
 
+    # Stationarity check at M1: see the matching block in
+    # inversion_filter_partial for the full rationale. Both conditions
+    # must hold: (a) SDA converged (residual ~ 0), and
+    # (b) max|eig(F)| < 1.
+    qme_residual = A_term + B_term @ F_terminal + C_term @ F_terminal @ F_terminal
+    res_norm = jnp.max(jnp.abs(qme_residual))
+    res_tol = 1e-6 if F_terminal.dtype == jnp.float64 else 1e-3
+    converged = res_norm < res_tol
+
+    eigs_M1 = jnp.linalg.eigvals(F_terminal)
+    rho_M1 = jnp.max(jnp.abs(eigs_M1))
+    spec_ok = rho_M1 < 1.0
+
+    stable_M1 = converged & spec_ok
+
     # ----- Step 3: Build per-period matrices -----
     def build_for_omega(omega_t):
         p = dict(params)
@@ -484,6 +539,12 @@ def inversion_filter(model, obs, params, monitor_index=None):
     sigma_vec = jnp.array([params['sigma_' + s] for s in shock_names])
     log_lik = -0.5 * T * jnp.sum(jnp.log(2 * jnp.pi * sigma_vec**2)) \
               - 0.5 * jnp.sum((eps_recovered / sigma_vec)**2)
+
+    # Reject non-stationary M1 and any non-finite log-likelihood (catches
+    # singular per-period M_t in the recursion). NumPyro treats -inf as
+    # a rejected proposal and skips this point cleanly.
+    log_lik = jnp.where(stable_M1 & jnp.isfinite(log_lik),
+                        log_lik, -jnp.inf)
 
     return log_lik, eps_recovered, cred_path
 
@@ -623,6 +684,41 @@ def inversion_filter_partial(model, obs_partial, params,
     A_term, B_term, C_term = build_ABC(params_M1)
     F_terminal = solve_terminal_jax(A_term, B_term, C_term)
 
+    # Stationarity check at the M1 (terminal) regime. Two conditions
+    # must hold for the PWL solution to be well-posed (Rendahl 2017):
+    #
+    #   (a) The structured doubling iteration CONVERGED to a true fixed
+    #       point, i.e. the residual of the quadratic matrix equation
+    #           A + B F + C F^2 = 0
+    #       is numerically zero. When the model is non-stationary SDA
+    #       does NOT converge -- it returns whatever F it had at the
+    #       last iteration, whose eigenvalues are arbitrary numerical
+    #       artifacts and CANNOT be used as the stability diagnostic.
+    #       The residual norm is the reliable signal.
+    #
+    #   (b) The converged F is stationary: max|eig(F)| < 1. M1 is the
+    #       terminal regime by assumption (the system reverts to it as
+    #       credibility recovers), so this is the necessary condition
+    #       for the backward recursion to be globally well-posed. M2
+    #       does NOT need its own stationary fixed point -- it only
+    #       enters as per-period A_t, B_t, C_t in the recursion.
+    #
+    # The residual tolerance scales with the working precision: float64
+    # easily reaches 1e-10 even for borderline rho ~ 0.99, so 1e-6 is
+    # comfortable. float32 only reaches ~1e-5 in the same case, so the
+    # tolerance is relaxed proportionally. ALWAYS run estimation in
+    # float64 (jax.config.update('jax_enable_x64', True)).
+    qme_residual = A_term + B_term @ F_terminal + C_term @ F_terminal @ F_terminal
+    res_norm = jnp.max(jnp.abs(qme_residual))
+    res_tol = 1e-6 if F_terminal.dtype == jnp.float64 else 1e-3
+    converged = res_norm < res_tol
+
+    eigs_M1 = jnp.linalg.eigvals(F_terminal)
+    rho_M1 = jnp.max(jnp.abs(eigs_M1))
+    spec_ok = rho_M1 < 1.0
+
+    stable_M1 = converged & spec_ok
+
     # ----- Step 3: Per-period matrices -----
     def build_for_omega(omega_t):
         p = dict(params)
@@ -690,6 +786,13 @@ def inversion_filter_partial(model, obs_partial, params,
     sigma_vec = jnp.array([params['sigma_' + s] for s in shock_names])
     log_lik = -0.5 * T * jnp.sum(jnp.log(2 * jnp.pi * sigma_vec**2)) \
               - 0.5 * jnp.sum((eps_all / sigma_vec)**2)
+
+    # Reject non-stationary M1 (terminal-regime spectral radius >= 1) and
+    # any non-finite log-likelihood (catches singular per-period M_t in
+    # the backward recursion, regardless of regime). NumPyro treats -inf
+    # as a rejected proposal, so the sampler skips this point cleanly.
+    log_lik = jnp.where(stable_M1 & jnp.isfinite(log_lik),
+                        log_lik, -jnp.inf)
 
     return log_lik, eps_all, cred_path, u_full
 
