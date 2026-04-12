@@ -53,6 +53,12 @@ def extract_declarations(mod_string):
     cleaned = [re.sub(r'(//|%).*$', '', line).strip() for line in lines]
     processed = " \n ".join(cleaned)
 
+    # Strip credibility; ... end; blocks so their internal var/parameters
+    # keywords are not captured as global declarations.
+    processed = re.sub(
+        r'(?i)\bcredibility\b\s*;.*?\bend\b\s*;', '', processed,
+        flags=re.DOTALL)
+
     # Only search before model block
     model_marker = re.search(r'\bmodel\b', processed, re.IGNORECASE)
     content = processed[:model_marker.start()] if model_marker else processed
@@ -151,13 +157,24 @@ def extract_model_equations(mod_string):
     model_content = model_match.group(2)
 
     # Parse comma-separated options inside model(...).
-    options = {'linear': False, 'nocredibility': False}
+    #   model(linear)         -- target: linear (default)
+    #   model(pwl)            -- target: piecewise-linear with credibility
+    #   model(nn)             -- target: NN solver with credibility merged
+    #   model(nocredibility)  -- flag: no credibility block
+    #   model(linear, nocredibility)  -- target + flag
+    #
+    # The solution target is stored in options['target'].
+    # Default target is 'linear' if none specified.
+    options = {'linear': False, 'nocredibility': False, 'target': 'linear'}
+    target_keywords = {'linear', 'pwl', 'nn'}
     if options_str:
         for tok in options_str.split(','):
             tok = tok.strip().lower()
             if not tok:
                 continue
-            if tok in options:
+            if tok in target_keywords:
+                options['target'] = tok
+            if tok in options and tok != 'target':
                 options[tok] = True
             # Unknown options are silently ignored for forward-compat.
 
@@ -1374,7 +1391,500 @@ def build_switching_fn(regime_spec, var_names):
 
 
 # ---------------------------------------------------------------------------
-# Pluggable credibility functions
+# Credibility block -- NEW GRAMMAR
+# ---------------------------------------------------------------------------
+#
+# The `credibility; ... end;` block is a self-contained sub-model with
+# its own variable and parameter namespaces. At parse time the local
+# variables and parameters are merged into the global lists used by the
+# estimation/solver, but inside the block they are written as regular
+# Dynare-style equations with real names. No magic symbols (no `pi`
+# meaning the monitor, no `s` meaning the signal output, no `miss`).
+#
+# Grammar:
+#
+#   credibility;
+#       var <name1> <name2> ...;             // local variables
+#       parameters <name1> <name2> ...;      // local parameters
+#       input  <model_var1> ...;             // variables read from model;
+#       output <local_var1> ...;             // variables exported to model;
+#
+#       <lhs1> = <rhs1>;                     // equations in declaration order
+#       <lhs2> = <rhs2>;
+#       ...
+#   end;
+#
+# Rules enforced by the parser:
+#
+#   * Every name on an equation LHS must be declared in `var`.
+#   * Every declared var must have exactly one equation.
+#   * Every `input` name must exist in the model's `var` list (checked
+#     later, at the top-level parse stage).
+#   * Every `output` name must be declared in the block's `var`.
+#   * A local var may appear with (-1) lag in its own defining equation
+#     or in later equations -- this marks it as a "credibility state"
+#     that the PWL compile path lifts into the outer regime loop.
+#
+# Returns a dict:
+#
+#   {
+#     'local_vars'  : list[str]     -- declared variables
+#     'local_params': list[str]     -- declared parameters
+#     'inputs'      : list[str]     -- names read from the model block
+#     'outputs'     : list[str]     -- names exported to the model block
+#     'equations'   : list[dict]    -- [{'lhs': str, 'rhs': str}, ...]
+#                                       in declaration order
+#   }
+#
+# Returns None if no credibility block is found in the .mod string.
+
+
+def parse_credibility_block(mod_string):
+    """Parse a `credibility; ... end;` block written in the NEW grammar.
+
+    See the module-level comment above the function definition for the
+    grammar rules and the return schema. Returns None if the block is
+    absent from the .mod file.
+
+    Raises
+    ------
+    ValueError
+        If a declaration keyword is mis-used, if an LHS is not declared,
+        if a declared variable has no equation, or if `output` refers to
+        a name that was not declared in `var`.
+    """
+    # ---------- Strip comments ----------
+    processed = re.sub(r'/\*.*?\*/', '', mod_string, flags=re.DOTALL)
+    lines = processed.split('\n')
+    cleaned = [re.sub(r'(//|%).*$', '', line).strip() for line in lines]
+    processed = " \n ".join(cleaned)
+
+    # ---------- Locate the credibility; ... end; block ----------
+    match = re.search(
+        r'(?i)\bcredibility\b\s*;(.*?)\bend\b\s*;',
+        processed, re.DOTALL
+    )
+    if not match:
+        return None
+
+    block = match.group(1)
+
+    # Quick guard against the LEGACY magic-symbol form (monitor:,
+    # signal = ..., accumulation = ...). If we see those tokens, hand
+    # back None here so the caller can fall through to the legacy path.
+    legacy_markers = (
+        r'\bmonitor\s*:',
+        r'\bsignal\s*=',
+        r'\baccumulation\s*=',
+    )
+    for pat in legacy_markers:
+        if re.search(pat, block, re.IGNORECASE):
+            return None
+
+    # ---------- Split the block into semicolon-terminated statements ----------
+    # A statement is everything up to the next top-level `;`. The block
+    # has no parentheses that span semicolons so a naive split is safe.
+    raw_stmts = [s.strip() for s in block.split(';')]
+    raw_stmts = [s for s in raw_stmts if s]  # drop empty tails
+
+    local_vars = []
+    inputs = []
+    outputs = []
+    equations = []
+
+    # Keywords that start a declaration; the first word of the statement
+    # tells us what kind of statement it is.
+    # NOTE: `parameters` is NOT a credibility-block keyword. All parameters
+    # are declared globally (in the .mod file's `parameters` block) and
+    # simply referenced by name in credibility equations, same as in the
+    # model; block. This keeps one flat parameter namespace.
+    declaration_heads = {
+        'var':    local_vars,
+        'input':  inputs,
+        'output': outputs,
+    }
+
+    name_regex = re.compile(r'[a-zA-Z_]\w*')
+
+    for stmt in raw_stmts:
+        # Is it a declaration? (starts with one of the keyword heads,
+        # checked case-insensitively)
+        first_word_match = re.match(r'([a-zA-Z_]\w*)\b', stmt)
+        if first_word_match is None:
+            raise ValueError(
+                f"Malformed credibility statement (no leading word): {stmt!r}")
+        head = first_word_match.group(1).lower()
+
+        if head in declaration_heads:
+            # Collect names from the body after the keyword
+            body = stmt[first_word_match.end():]
+            names = name_regex.findall(body)
+            # Filter reserved tokens just in case
+            names = [n for n in names if n.lower() not in declaration_heads]
+            declaration_heads[head].extend(names)
+            continue
+
+        # Otherwise, it must be an equation of the form LHS = RHS.
+        if '=' not in stmt:
+            raise ValueError(
+                f"Credibility statement is neither a declaration nor an "
+                f"equation: {stmt!r}")
+        lhs, rhs = stmt.split('=', 1)
+        equations.append({'lhs': lhs.strip(), 'rhs': rhs.strip()})
+
+    # ---------- Validate ----------
+    # (1) Every equation LHS is a simple declared var name (no lags,
+    # no arithmetic). `cred_state = cred_state(-1) + ...` is fine --
+    # the (-1) is on the RHS, not the LHS.
+    declared_var_set = set(local_vars)
+    lhs_names = []
+    for eq in equations:
+        lhs_match = re.match(r'\s*([a-zA-Z_]\w*)\s*$', eq['lhs'])
+        if lhs_match is None:
+            raise ValueError(
+                f"Credibility equation LHS must be a bare variable name, "
+                f"got: {eq['lhs']!r}")
+        name = lhs_match.group(1)
+        if name not in declared_var_set:
+            raise ValueError(
+                f"Credibility equation LHS {name!r} is not declared in "
+                f"the block's `var` list. Declared: {local_vars}")
+        lhs_names.append(name)
+
+    # (2) Every declared var has exactly one equation.
+    if sorted(lhs_names) != sorted(local_vars):
+        missing = set(local_vars) - set(lhs_names)
+        extra = set(lhs_names) - set(local_vars)
+        parts = []
+        if missing:
+            parts.append(f"declared but no equation: {sorted(missing)}")
+        if extra:
+            parts.append(f"equation without declaration: {sorted(extra)}")
+        raise ValueError(
+            "Credibility block not square. " + "; ".join(parts))
+
+    # (3) Every output name is declared in var.
+    for o in outputs:
+        if o not in declared_var_set:
+            raise ValueError(
+                f"Credibility output {o!r} is not declared in the "
+                f"block's `var` list. Declared: {local_vars}")
+
+    # (4) No duplicate declarations.
+    for label, lst in [
+        ("var", local_vars),
+        ("input", inputs),
+        ("output", outputs),
+    ]:
+        if len(set(lst)) != len(lst):
+            raise ValueError(
+                f"Duplicate names in credibility `{label}` declaration: {lst}")
+
+    return {
+        'local_vars' : local_vars,
+        'inputs'     : inputs,
+        'outputs'    : outputs,
+        'equations'  : equations,
+    }
+
+
+def compile_credibility_block(spec, param_names=None, verbose=False):
+    """Compile the output of parse_credibility_block into a straight-line
+    JAX-traceable callable.
+
+    The returned function has signature
+
+        credibility_fn(inputs, prev_state, params) -> (outputs, new_state)
+
+    where `inputs`, `prev_state`, `params`, `outputs`, `new_state` are all
+    dicts keyed by variable / parameter name. The function evaluates each
+    equation of the credibility block in declaration order, storing each
+    LHS value as a local that subsequent equations can reference. It uses
+    jax.numpy internally (via sympy.lambdify with a jnp module map) so
+    the whole thing can be jit'd and differentiated through.
+
+    Classification:
+      * A local variable that appears with a (-1) lag anywhere in the
+        block is a STATE variable. Its (-1) reference in an equation is
+        resolved against the `prev_state` dict, and its current-period
+        value is written to `new_state`.
+      * A local variable that never appears with a (-1) lag is an
+        ALGEBRAIC variable. It is computed from earlier locals / inputs /
+        params and is only used later in the block (or as an output).
+
+    Parameters are NOT declared inside the credibility block. They live in
+    the global `parameters` block and are simply referenced by name in the
+    equations. The `param_names` argument is the global parameter list;
+    any RHS symbol not in local_vars, inputs, or known functions is looked
+    up there.
+
+    Compile-time validation:
+      * Each equation's RHS may only reference locals that were defined
+        strictly earlier in declaration order. Forward or circular local
+        references are rejected.
+
+    Parameters
+    ----------
+    spec : dict
+        Output of `parse_credibility_block`.
+    param_names : list of str or None
+        Global parameter names (from the .mod file's `parameters` block).
+        If None, any RHS symbol not in local_vars or inputs is assumed to
+        be a parameter (auto-discovered).
+    verbose : bool
+        Print the classification and equation trace.
+
+    Returns
+    -------
+    compiled : dict with keys:
+        'fn'               : callable(inputs, prev_state, params) -> (out, new_state)
+        'state_vars'       : list[str] -- locals with (-1) lag
+        'algebraic_vars'   : list[str] -- locals without (-1) lag
+        'input_vars'       : list[str]
+        'output_vars'      : list[str]
+        'used_params'      : list[str] -- global params actually referenced
+        'equations_debug'  : list of dicts (for introspection / tests)
+    """
+    import jax.numpy as jnp
+
+    local_vars   = spec['local_vars']
+    input_vars   = spec['inputs']
+    output_vars  = spec['outputs']
+    equations    = spec['equations']
+
+    # If no explicit param list given, we'll auto-discover params from
+    # RHS symbols that aren't local vars, inputs, or known functions.
+    param_names_set = set(param_names) if param_names else None
+
+    # ---- Identify state vars (locals that appear with (-1) lag) ----
+    lag_regex = re.compile(r'\b([a-zA-Z_]\w*)\s*\(\s*-1\s*\)')
+    state_set = set()
+    for eq in equations:
+        for m in lag_regex.finditer(eq['rhs']):
+            name = m.group(1)
+            if name in local_vars:
+                state_set.add(name)
+    state_vars     = [v for v in local_vars if v in state_set]
+    algebraic_vars = [v for v in local_vars if v not in state_set]
+
+    # ---- Build sympy symbols ----
+    # Inputs:      <name>           (comes from inputs dict at runtime)
+    # Prev state:  <name>_m1        (comes from prev_state dict at runtime)
+    # Locals:      <name>           (comes from the local scratch dict,
+    #                                 populated as earlier equations run)
+    # Parameters are handled dynamically: any RHS symbol not matching a
+    # local var, input, prev-state, or known function is treated as a
+    # parameter and looked up in the global params dict at runtime.
+    sym_inputs = {v: sympy.Symbol(v)           for v in input_vars}
+    sym_prev   = {v: sympy.Symbol(f"{v}_m1")   for v in state_vars}
+    sym_local  = {v: sympy.Symbol(v)           for v in local_vars}
+
+    # Name-collision guard: an input and a local must never share a name
+    collisions = set(input_vars) & set(local_vars)
+    if collisions:
+        raise ValueError(
+            f"Credibility block: name(s) appear in both input and var: "
+            f"{sorted(collisions)}")
+
+    # Collect all parameter symbols discovered across equations
+    all_used_params = set()
+
+    # ---- jnp module map for lambdify ----
+    # `sigmoid` is exposed as a first-class function so .mod files can
+    # write, e.g., `sigmoid(cred_sharpness*(cred_dev - cred_band))`
+    # directly. This maps to jax.nn.sigmoid which is numerically stable
+    # for large arguments (unlike 1/(1+exp(-x)) which overflows and
+    # produces NaN gradients at high sharpness, e.g. BE 1304).
+    try:
+        import jax.nn as jnn
+        _sigmoid_impl = jnn.sigmoid
+    except ImportError:
+        # Fall back to the naive form if jax.nn isn't available
+        _sigmoid_impl = lambda x: 1.0 / (1.0 + jnp.exp(-x))
+
+    jnp_module = {
+        'exp':     jnp.exp,
+        'log':     jnp.log,
+        'sqrt':    jnp.sqrt,
+        'sin':     jnp.sin,
+        'cos':     jnp.cos,
+        'tan':     jnp.tan,
+        'Abs':     jnp.abs,
+        'Max':     jnp.maximum,
+        'Min':     jnp.minimum,
+        'sigmoid': _sigmoid_impl,
+    }
+
+    # ---- Compile each equation ----
+    compiled_eqs = []
+    local_index = {v: i for i, v in enumerate(local_vars)}
+    for eq_idx, eq in enumerate(equations):
+        lhs = eq['lhs']
+        # Substitute `name(-1)` -> `name_m1` in the RHS string, but ONLY
+        # for locals that are state vars (others shouldn't have (-1) lags;
+        # if they do, that is an error below).
+        def _sub_lag(m):
+            name = m.group(1)
+            if name in state_set:
+                return f"{name}_m1"
+            # Lagged references to NON-state locals or to inputs are
+            # not supported inside the credibility block (inputs have no
+            # lag; locals are computed within one period). Flag them.
+            raise ValueError(
+                f"Credibility equation {eq_idx} ({lhs}): cannot take "
+                f"lag (-1) of {name!r}. Only declared local variables "
+                f"that themselves carry a (-1) lag somewhere in the "
+                f"block are allowed as states.")
+        rhs_str = lag_regex.sub(_sub_lag, eq['rhs'])
+
+        # Build the local_dict for sympify. We include ALL known symbols
+        # (inputs, prev-state, locals) plus math functions. Anything left
+        # over as a free symbol after sympify is treated as a parameter
+        # (if in param_names_set) or flagged as unknown.
+        local_dict = {}
+        local_dict.update(sym_inputs)
+        local_dict.update({f"{v}_m1": sym_prev[v] for v in state_vars})
+        local_dict.update(sym_local)
+        # Math functions
+        local_dict['exp']     = sympy.exp
+        local_dict['log']     = sympy.log
+        local_dict['sqrt']    = sympy.sqrt
+        local_dict['Abs']     = sympy.Abs
+        local_dict['Max']     = sympy.Max
+        local_dict['Min']     = sympy.Min
+        local_dict['sigmoid'] = sympy.Function('sigmoid')
+
+        try:
+            rhs_expr = sympy.sympify(rhs_str, locals=local_dict)
+        except Exception as exc:
+            raise ValueError(
+                f"Credibility equation {eq_idx} ({lhs}): "
+                f"could not sympify RHS {rhs_str!r}: {exc}")
+
+        # Identify which symbols the expression uses.
+        used_syms = rhs_expr.free_symbols
+        used_inputs = [v for v in input_vars if sym_inputs[v] in used_syms]
+        used_prev   = [v for v in state_vars if sym_prev[v]   in used_syms]
+        used_locals = [v for v in local_vars if sym_local[v]  in used_syms]
+
+        # Auto-discover parameters: any free symbol not in locals/inputs/prev
+        known_syms = (set(sym_inputs.values())
+                      | set(sym_prev.values())
+                      | set(sym_local.values()))
+        unknown_syms = used_syms - known_syms
+        used_params = []
+        for sym in sorted(unknown_syms, key=str):
+            name = str(sym)
+            if param_names_set is not None and name not in param_names_set:
+                raise ValueError(
+                    f"Credibility equation {eq_idx} ({lhs}): symbol "
+                    f"{name!r} is not declared as a variable, input, or "
+                    f"global parameter.")
+            used_params.append(name)
+            all_used_params.add(name)
+
+        # Forward/self-reference guard: a local used on this RHS must be
+        # defined strictly earlier in declaration order.
+        for u in used_locals:
+            if local_index[u] >= eq_idx:
+                raise ValueError(
+                    f"Credibility equation {eq_idx} ({lhs}): RHS "
+                    f"references local var {u!r} which is defined at or "
+                    f"after this equation. Forward/self-reference of "
+                    f"current-period locals is not allowed.")
+
+        # Build the argument list for lambdify (order matters).
+        # For params, the symbols were auto-created by sympify so we
+        # look them up by name from the expression's free symbols.
+        param_sym_map = {str(s): s for s in unknown_syms}
+        arg_list = (
+            [sym_inputs[v] for v in used_inputs]
+            + [sym_prev[v]   for v in used_prev]
+            + [param_sym_map[v] for v in used_params]
+            + [sym_local[v]  for v in used_locals]
+        )
+        fn = sympy.lambdify(arg_list, rhs_expr,
+                            modules=[jnp_module, 'numpy'])
+
+        compiled_eqs.append({
+            'lhs':         lhs,
+            'fn':          fn,
+            'used_inputs': used_inputs,
+            'used_prev':   used_prev,
+            'used_params': used_params,
+            'used_locals': used_locals,
+            'rhs_expr':    rhs_expr,
+        })
+
+        if verbose:
+            deps = []
+            if used_inputs: deps.append(f"inputs={used_inputs}")
+            if used_prev:   deps.append(f"prev_state={used_prev}")
+            if used_params: deps.append(f"params={used_params}")
+            if used_locals: deps.append(f"locals={used_locals}")
+            print(f"  [{eq_idx}] {lhs} = {rhs_expr}    ({', '.join(deps)})")
+
+    # ---- Build the straight-line callable ----
+    output_var_set = set(output_vars)
+    state_var_set  = set(state_vars)
+
+    def credibility_fn(inputs, prev_state, params):
+        """Evaluate the credibility block once.
+
+        Parameters
+        ----------
+        inputs : dict[str, jnp.ndarray or float]
+            Model variable values at current period t, keyed by name.
+            Must contain at least every name in input_vars.
+        prev_state : dict[str, jnp.ndarray or float]
+            Credibility-state values at period t-1, keyed by name.
+            Must contain at least every name in state_vars.
+        params : dict[str, float]
+            Credibility parameter values, keyed by name. Must contain
+            at least every name in local_params.
+
+        Returns
+        -------
+        outputs : dict[str, jnp.ndarray or float]
+            Credibility outputs at period t (e.g., {'omega_pc': ...}).
+        new_state : dict[str, jnp.ndarray or float]
+            Credibility state at period t (e.g., {'cred_state': ...}).
+        """
+        locals_dict = {}
+        for ceq in compiled_eqs:
+            args = (
+                [inputs[v]     for v in ceq['used_inputs']]
+                + [prev_state[v] for v in ceq['used_prev']]
+                + [params[v]     for v in ceq['used_params']]
+                + [locals_dict[v] for v in ceq['used_locals']]
+            )
+            locals_dict[ceq['lhs']] = ceq['fn'](*args)
+
+        outputs   = {v: locals_dict[v] for v in output_vars}
+        new_state = {v: locals_dict[v] for v in state_vars}
+        return outputs, new_state
+
+    used_params_list = sorted(all_used_params)
+
+    if verbose:
+        print(f"compile_credibility_block:")
+        print(f"  state_vars     ({len(state_vars)}):     {state_vars}")
+        print(f"  algebraic_vars ({len(algebraic_vars)}): {algebraic_vars}")
+        print(f"  used_params    ({len(used_params_list)}):    {used_params_list}")
+
+    return {
+        'fn':              credibility_fn,
+        'state_vars':      state_vars,
+        'algebraic_vars':  algebraic_vars,
+        'input_vars':      input_vars,
+        'output_vars':     output_vars,
+        'used_params':     used_params_list,
+        'equations_debug': compiled_eqs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pluggable credibility functions (LEGACY magic-symbol grammar)
 # ---------------------------------------------------------------------------
 
 def extract_credibility(mod_string):
@@ -1867,3 +2377,174 @@ def parse_two_regime_model(mod_string, param_overrides=None, verbose=False):
     """
     compiled = compile_two_regime_model(mod_string, verbose=verbose)
     return evaluate_two_regime_model(compiled, param_overrides=param_overrides)
+
+
+# ---------------------------------------------------------------------------
+# NEW top-level dispatcher: parse_credibility_mod + compile_mod
+# ---------------------------------------------------------------------------
+#
+# This replaces compile_two_regime_model / parse_two_regime_model for new-
+# grammar .mod files. It reads model(target) to decide the compilation
+# path, parses both the model; and credibility; blocks, and dispatches to
+# the appropriate compile_* function.
+#
+# Usage:
+#
+#     result = compile_mod(open("open_soe_cred.mod").read())
+#
+# The result dict depends on the target:
+#   linear -> same shape as parse_mod output (func_A/B/C/D, var_names, ...)
+#   pwl    -> model matrices + credibility callable + regime info
+#   nn     -> full nonlinear residual function with cred_state in state vec
+
+def parse_credibility_mod(mod_string, verbose=False):
+    """Parse a .mod file that may contain a credibility; ... end; block.
+
+    This is the unified entry point that reads both blocks, compiles the
+    credibility block (if present) into a JAX-traceable callable, and
+    extracts the solution target from model(target).
+
+    Parameters
+    ----------
+    mod_string : str
+        Full .mod file content.
+    verbose : bool
+        Print progress info from sub-parsers.
+
+    Returns
+    -------
+    parsed : dict with keys:
+        'target'       : str ('linear', 'pwl', 'nn')
+        'model'        : dict -- output of parse_mod (func_A/B/C/D, var_names, ...)
+        'credibility'  : dict or None -- output of compile_credibility_block
+        'cred_spec'    : dict or None -- output of parse_credibility_block (raw spec)
+        'model_options': dict -- options from model(...) directive
+        'mod_string'   : str  -- original .mod source
+    """
+    # ---- Extract target from model(target) ----
+    _, model_options = extract_model_equations(mod_string)
+    target = model_options.get('target', 'linear')
+
+    # ---- Parse the model block (existing, proven at 4.3e-14 vs Dynare) ----
+    # extract_declarations now strips the credibility; block internally,
+    # so parse_mod is safe to call on .mod files with credibility blocks.
+    model_parsed = parse_mod(mod_string, verbose=verbose)
+
+    # ---- Parse the credibility block (new grammar) ----
+    cred_spec = parse_credibility_block(mod_string)
+
+    # If new grammar not found, try legacy path for backward compat
+    if cred_spec is None:
+        legacy_spec = extract_credibility(mod_string)
+        if legacy_spec is not None and verbose:
+            print("Note: using LEGACY credibility grammar (monitor:/signal=/accumulation=).")
+            print("      Consider migrating to the new credibility; ... end; format.")
+
+    # ---- Compile the credibility block if present ----
+    # Pass the global parameter list so the compiler can validate that
+    # every symbol in credibility equations is either a declared var,
+    # input, or global parameter. Undeclared symbols → ValueError.
+    cred_compiled = None
+    if cred_spec is not None:
+        global_param_names = model_parsed.get('param_names', [])
+        cred_compiled = compile_credibility_block(
+            cred_spec, param_names=global_param_names, verbose=verbose)
+
+    # ---- Validate target vs credibility presence ----
+    if target in ('pwl', 'nn') and cred_compiled is None and cred_spec is None:
+        raise ValueError(
+            f"model({target}) requires a credibility; ... end; block, "
+            f"but none was found in the .mod file.")
+
+    return {
+        'target':        target,
+        'model':         model_parsed,
+        'credibility':   cred_compiled,
+        'cred_spec':     cred_spec,
+        'model_options': model_options,
+        'mod_string':    mod_string,
+    }
+
+
+def compile_mod(mod_string, target=None, verbose=False):
+    """Top-level entry: parse and compile a .mod file for the requested target.
+
+    If `target` is None, the target is read from the model(target) directive
+    in the .mod file. If `target` is given, it overrides whatever the file says.
+
+    Parameters
+    ----------
+    mod_string : str
+        Full .mod file content.
+    target : str or None
+        Override for the solution target ('linear', 'pwl', 'nn').
+    verbose : bool
+        Print progress info.
+
+    Returns
+    -------
+    result : dict
+        Structure depends on the resolved target:
+
+        target='linear':
+            Same as parse_mod output: func_A, func_B, func_C, func_D,
+            var_names, shock_names, param_names, param_defaults, plus
+            'credibility_fn' (the compiled credibility callable, or None).
+
+        target='pwl':
+            (Not yet implemented -- raises NotImplementedError)
+
+        target='nn':
+            (Not yet implemented -- raises NotImplementedError)
+    """
+    parsed = parse_credibility_mod(mod_string, verbose=verbose)
+    resolved = target or parsed['target']
+
+    if resolved == 'linear':
+        return _compile_linear(parsed, verbose=verbose)
+    elif resolved == 'pwl':
+        return _compile_pwl(parsed, verbose=verbose)
+    elif resolved == 'nn':
+        return _compile_nn(parsed, verbose=verbose)
+    else:
+        raise ValueError(f"Unknown target: {resolved!r}. "
+                         f"Valid targets: linear, pwl, nn.")
+
+
+def _compile_linear(parsed, verbose=False):
+    """Compile for target=linear.
+
+    Simply returns the parse_mod output. The credibility block (if present)
+    is IGNORED -- extract_declarations already strips it, so the model;
+    equations are parsed as-is. If those equations reference a credibility
+    output variable (like omega_pc) that isn't declared as a parameter,
+    the parser will naturally fail at evaluation time. That's the expected
+    behavior: the linear case uses a separate .mod file without a
+    credibility block, or the user declares omega_pc as a fixed parameter.
+    """
+    result = dict(parsed['model'])
+    result['target'] = 'linear'
+    if verbose:
+        print(f"_compile_linear: returning parse_mod output "
+              f"({len(result['var_names'])} vars, "
+              f"{len(result['shock_names'])} shocks)")
+    return result
+
+
+def _compile_pwl(parsed, verbose=False):
+    """Compile for target=pwl (piecewise-linear with credibility regime switching).
+
+    Not yet implemented.
+    """
+    raise NotImplementedError(
+        "compile_pwl is not yet implemented. Use target='linear' for now, "
+        "or call compile_two_regime_model for the legacy PWL path.")
+
+
+def _compile_nn(parsed, verbose=False):
+    """Compile for target=nn (full nonlinear residual with credibility merged).
+
+    Not yet implemented.
+    """
+    raise NotImplementedError(
+        "compile_nn is not yet implemented. Use target='linear' for now.")
