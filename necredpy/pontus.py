@@ -196,9 +196,108 @@ def backward_recursion(regime_seq, F_terminal, matrices_M1, matrices_M2):
     return F_path, E_path, Q_path
 
 
+def backward_recursion_continuous(A_all, B_all, C_all, D_const_all,
+                                  F_terminal):
+    """Backward recursion with per-period matrices (continuous omega).
+
+    Instead of selecting from two regimes, this takes pre-computed
+    per-period matrices A(omega_t), B(omega_t), C(omega_t). Used by
+    the continuous-credibility PWL solver where omega varies smoothly.
+
+    The recursion is identical to backward_recursion but with
+    per-period matrix arrays instead of regime selection.
+
+    Parameters
+    ----------
+    A_all : ndarray (T, n, n)
+    B_all : ndarray (T, n, n)
+    C_all : ndarray (T, n, n)
+    D_const_all : ndarray (T, n)
+        Constant terms per period (zero for models linearized at SS).
+    F_terminal : ndarray (n, n)
+        Terminal regime policy function (solved at omega_high).
+
+    Returns
+    -------
+    F_path : ndarray (T, n, n)
+    E_path : ndarray (T, n)
+    Q_path : ndarray (T, n, n)
+    """
+    T = A_all.shape[0]
+    n = A_all.shape[1]
+
+    F_path = np.zeros((T, n, n))
+    E_path = np.zeros((T, n))
+    Q_path = np.zeros((T, n, n))
+
+    F_next = F_terminal.copy()
+    E_next = np.zeros(n)
+
+    for t in range(T - 1, -1, -1):
+        A_t = A_all[t]
+        B_t = B_all[t]
+        C_t = C_all[t]
+        D_t = D_const_all[t]
+
+        M_t = B_t + C_t @ F_next
+        F_t = -solve(M_t, A_t)
+        E_t = -solve(M_t, C_t @ E_next + D_t)
+        Q_t = -inv(M_t)
+
+        F_path[t] = F_t
+        E_path[t] = E_t
+        Q_path[t] = Q_t
+
+        F_next = F_t
+        E_next = E_t
+
+    return F_path, E_path, Q_path
+
+
 # ---------------------------------------------------------------------------
 # Forward simulation
 # ---------------------------------------------------------------------------
+
+def simulate_forward_with_shocks(F_path, E_path, Q_path, D_all, epsilon,
+                                 u0=None):
+    """Forward simulation with per-period shock loading matrices.
+
+    u_t = E_t + F_t @ u_{t-1} + (-Q_t) @ D_t @ epsilon_t
+
+    Sign convention: Q_t = -inv(M_t) from the backward recursion.
+    The parser stores D with sign flip: A y(-1) + B y + C y(+1) - D eps = 0.
+    So the impact of shocks on the state is:
+        inv(M_t) @ D_t @ eps = (-Q_t) @ D_t @ eps
+
+    Parameters
+    ----------
+    F_path : ndarray (T, n, n)
+    E_path : ndarray (T, n)
+    Q_path : ndarray (T, n, n)
+    D_all : ndarray (T, n, n_shocks)
+        Per-period shock loading matrices (parser convention: -dF/deps).
+    epsilon : ndarray (T, n_shocks)
+    u0 : ndarray (n,) or None
+
+    Returns
+    -------
+    u_path : ndarray (T, n)
+    """
+    T = F_path.shape[0]
+    n = F_path.shape[1]
+    u_path = np.zeros((T, n))
+
+    u_prev = np.zeros(n) if u0 is None else u0.copy()
+
+    for t in range(T):
+        # -Q because Q = -inv(M), and impact = inv(M) @ D @ eps
+        impact = (-Q_path[t]) @ D_all[t] @ epsilon[t]
+        u_t = E_path[t] + F_path[t] @ u_prev + impact
+        u_path[t] = u_t
+        u_prev = u_t
+
+    return u_path
+
 
 def simulate_forward(F_path, E_path, Q_path, epsilon, u0=None):
     """Forward simulation given time-varying policy functions and shocks.

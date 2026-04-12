@@ -295,7 +295,7 @@ def _expand_aux_variables(raw_equations, var_names, shock_names, verbose=False):
     return expanded_equations, expanded_var_names, aux_vars_added, aux_resolution
 
 
-def parse_mod(mod_string, verbose=False):
+def parse_mod(mod_string, verbose=False, coefficient_names=None):
     """Parse a .mod file and return lambdified matrix functions.
 
     Parameters
@@ -304,6 +304,23 @@ def parse_mod(mod_string, verbose=False):
         Full content of the .mod file.
     verbose : bool
         Print progress info.
+    coefficient_names : list of str or None
+        Names of time-varying coefficients that appear in the model
+        equations but are NOT estimated parameters and NOT endogenous
+        variables. Typical example: 'omega_pc' -- the credibility
+        output that enters the Phillips curve as a coefficient.
+
+        These are kept SEPARATE from param_names so that NUTS never
+        sees them. The lambdified matrix functions take them as extra
+        arguments AFTER the parameter list:
+
+            func_A(*param_values, *coeff_values) -> numpy array
+
+        When coefficient_names is None (the default), the lambdified
+        functions take only parameters and any free symbol in the
+        equations that is not a variable, shock, or parameter will
+        cause a runtime NameError. This is the correct behavior for
+        model(linear), where the user must declare everything.
 
     Returns
     -------
@@ -360,8 +377,17 @@ def parse_mod(mod_string, verbose=False):
     param_syms = {p: sympy.symbols(p) for p in param_names}
     shock_syms = {s: sympy.symbols(s) for s in shock_names}
 
+    # Coefficient symbols: time-varying coefficients (e.g. omega_pc from
+    # credibility block) that are NOT parameters and NOT variables.
+    # They appear in A/B/C as symbolic coefficients and are passed as
+    # separate arguments to the lambdified functions.
+    coeff_names = coefficient_names or []
+    coeff_syms = {c: sympy.symbols(c) for c in coeff_names}
+
     var_syms = {}
-    all_syms_for_parsing = set(param_syms.values()) | set(shock_syms.values())
+    all_syms_for_parsing = (set(param_syms.values())
+                            | set(shock_syms.values())
+                            | set(coeff_syms.values()))
     for var in var_names:
         sym_m1 = _create_timed_symbol(var, -1)
         sym_t = _create_timed_symbol(var, 0)
@@ -415,7 +441,7 @@ def parse_mod(mod_string, verbose=False):
 
         # Replace bare variable names (implicitly time t)
         all_names = sorted(
-            list(var_syms.keys()) + param_names + shock_names,
+            list(var_syms.keys()) + param_names + shock_names + coeff_names,
             key=len, reverse=True
         )
         for name in all_names:
@@ -426,6 +452,8 @@ def parse_mod(mod_string, verbose=False):
                 replacement = str(param_syms[name])
             elif name in shock_syms:
                 replacement = str(shock_syms[name])
+            elif name in coeff_syms:
+                replacement = str(coeff_syms[name])
             else:
                 continue
             eq_sym = re.sub(pattern, replacement, eq_sym)
@@ -685,12 +713,15 @@ def parse_mod(mod_string, verbose=False):
 
     # --- Step 6: Lambdify ---
     param_sym_list = [param_syms[p] for p in param_names]
+    coeff_sym_list = [coeff_syms[c] for c in coeff_names]
+    # Lambdified functions take: func_A(*param_values, *coeff_values)
+    full_sym_list = param_sym_list + coeff_sym_list
 
-    func_A = sympy.lambdify(param_sym_list, sympy_A, modules='numpy')
-    func_B = sympy.lambdify(param_sym_list, sympy_B, modules='numpy')
-    func_C = sympy.lambdify(param_sym_list, sympy_C, modules='numpy')
-    func_D = sympy.lambdify(param_sym_list, sympy_D, modules='numpy')
-    func_D_const = sympy.lambdify(param_sym_list, sympy_D_const, modules='numpy')
+    func_A = sympy.lambdify(full_sym_list, sympy_A, modules='numpy')
+    func_B = sympy.lambdify(full_sym_list, sympy_B, modules='numpy')
+    func_C = sympy.lambdify(full_sym_list, sympy_C, modules='numpy')
+    func_D = sympy.lambdify(full_sym_list, sympy_D, modules='numpy')
+    func_D_const = sympy.lambdify(full_sym_list, sympy_D_const, modules='numpy')
 
     result = {
         'func_A': func_A,
@@ -702,6 +733,7 @@ def parse_mod(mod_string, verbose=False):
         'shock_names': shock_names,
         'param_names': param_names,
         'param_defaults': param_defaults,
+        'coefficient_names': coeff_names,
         # Model-block options parsed from `model(...)`. Currently:
         #   nocredibility -- declares that the model has no credibility
         #                    block; downstream code (compile_two_regime_model,
@@ -718,6 +750,7 @@ def parse_mod(mod_string, verbose=False):
         '_sympy_D': sympy_D,
         '_sympy_D_const': sympy_D_const,
         '_param_sym_list': param_sym_list,
+        '_coeff_sym_list': coeff_sym_list,
     }
 
     return result
@@ -745,15 +778,23 @@ def jax_lambdify(parsed):
 
     jax_mod = [{'ImmutableDenseMatrix': jnp.array}, 'jax']
     psl = parsed['_param_sym_list']
+    csl = parsed.get('_coeff_sym_list', [])
+    full_sym_list = psl + csl
 
     return {
-        'func_A': sympy.lambdify(psl, parsed['_sympy_A'], modules=jax_mod),
-        'func_B': sympy.lambdify(psl, parsed['_sympy_B'], modules=jax_mod),
-        'func_C': sympy.lambdify(psl, parsed['_sympy_C'], modules=jax_mod),
-        'func_D': sympy.lambdify(psl, parsed['_sympy_D'], modules=jax_mod),
-        'func_D_const': sympy.lambdify(psl, parsed['_sympy_D_const'],
+        'func_A': sympy.lambdify(full_sym_list, parsed['_sympy_A'],
+                                  modules=jax_mod),
+        'func_B': sympy.lambdify(full_sym_list, parsed['_sympy_B'],
+                                  modules=jax_mod),
+        'func_C': sympy.lambdify(full_sym_list, parsed['_sympy_C'],
+                                  modules=jax_mod),
+        'func_D': sympy.lambdify(full_sym_list, parsed['_sympy_D'],
+                                  modules=jax_mod),
+        'func_D_const': sympy.lambdify(full_sym_list,
+                                        parsed['_sympy_D_const'],
                                         modules=jax_mod),
         'param_names': parsed['param_names'],
+        'coefficient_names': parsed.get('coefficient_names', []),
         'var_names': parsed['var_names'],
         'shock_names': parsed['shock_names'],
         'param_defaults': parsed['param_defaults'],
@@ -2425,13 +2466,25 @@ def parse_credibility_mod(mod_string, verbose=False):
     _, model_options = extract_model_equations(mod_string)
     target = model_options.get('target', 'linear')
 
+    # ---- Parse the credibility block (new grammar) first ----
+    # We need to know the output variable names BEFORE calling parse_mod,
+    # so we can pass them as coefficient_names. This ensures the sympy
+    # matrices treat credibility outputs (e.g. omega_pc) as symbolic
+    # coefficients, NOT as estimated parameters.
+    cred_spec = parse_credibility_block(mod_string)
+
+    # For model(pwl) and model(nn), credibility outputs are time-varying
+    # coefficients in the model equations. For model(linear), the user
+    # must declare them as parameters themselves.
+    coeff_names = None
+    if cred_spec is not None and target in ('pwl', 'nn'):
+        coeff_names = cred_spec['outputs']
+
     # ---- Parse the model block (existing, proven at 4.3e-14 vs Dynare) ----
     # extract_declarations now strips the credibility; block internally,
     # so parse_mod is safe to call on .mod files with credibility blocks.
-    model_parsed = parse_mod(mod_string, verbose=verbose)
-
-    # ---- Parse the credibility block (new grammar) ----
-    cred_spec = parse_credibility_block(mod_string)
+    model_parsed = parse_mod(mod_string, verbose=verbose,
+                             coefficient_names=coeff_names)
 
     # If new grammar not found, try legacy path for backward compat
     if cred_spec is None:
@@ -2532,13 +2585,340 @@ def _compile_linear(parsed, verbose=False):
 
 
 def _compile_pwl(parsed, verbose=False):
-    """Compile for target=pwl (piecewise-linear with credibility regime switching).
+    """Compile for target=pwl (piecewise-linear with continuous credibility).
 
-    Not yet implemented.
+    Returns a compiled model where:
+      - The A/B/C/D matrix functions take (*param_values, omega_pc) as
+        arguments, with omega_pc as a separate coefficient (NOT an
+        estimated parameter).
+      - A build_ABC(params_dict, omega_pc) convenience function evaluates
+        the matrices at given parameters and credibility forward weight.
+      - The credibility callable advances cred_state one period given
+        inputs (e.g. pi_cpi_yoy) and previous state.
+      - solve_irf() runs the full Pontus outer loop with continuous
+        omega path convergence.
+
+    The PWL solver treats credibility as a continuous state variable:
+    omega_pc = omega_low + (omega_high - omega_low) * cred_state, where
+    cred_state evolves according to the credibility law of motion. At
+    each period, the model is linearized at the current omega_pc value.
+    The outer loop iterates until the omega path converges.
+
+    Parameters
+    ----------
+    parsed : dict
+        Output of parse_credibility_mod().
+    verbose : bool
+
+    Returns
+    -------
+    compiled : dict with keys:
+        'target'           : 'pwl'
+        'func_A/B/C/D/D_const' : callables taking (*param_values, omega_pc)
+        'build_ABC'        : callable(params_dict, omega_pc) -> (A, B, C)
+        'build_ABCD'       : callable(params_dict, omega_pc) -> (A, B, C, D, D_const)
+        'var_names'        : list[str]
+        'shock_names'      : list[str]
+        'param_names'      : list[str] (estimated parameters only)
+        'param_defaults'   : dict
+        'coefficient_names': list[str] (e.g. ['omega_pc'])
+        'credibility_fn'   : callable(inputs, prev_state, params) -> (out, new_state)
+        'credibility_info' : dict with state_vars, input_vars, output_vars, used_params
+        'solve_irf'        : callable(shock_name, size, T, params_dict, ...) -> result
     """
-    raise NotImplementedError(
-        "compile_pwl is not yet implemented. Use target='linear' for now, "
-        "or call compile_two_regime_model for the legacy PWL path.")
+    model = parsed['model']
+    cred = parsed['credibility']
+    cred_spec = parsed['cred_spec']
+
+    if cred is None:
+        raise ValueError(
+            "model(pwl) requires a credibility block, but none was compiled. "
+            "Check that the .mod file has a credibility; ... end; block.")
+
+    coeff_names = model.get('coefficient_names', [])
+    if not coeff_names:
+        raise ValueError(
+            "model(pwl): no coefficient_names found in parsed model. "
+            "The credibility output variables should appear as coefficients.")
+
+    # ---- Matrix evaluation helpers ----
+    func_A = model['func_A']
+    func_B = model['func_B']
+    func_C = model['func_C']
+    func_D = model['func_D']
+    func_D_const = model['func_D_const']
+    param_names = model['param_names']
+    n = len(model['var_names'])
+
+    def _param_args(params_dict):
+        """Extract ordered parameter values from a dict."""
+        return [params_dict[p] for p in param_names]
+
+    def build_ABC(params_dict, omega_pc):
+        """Build A, B, C matrices at given parameters and omega_pc.
+
+        Parameters
+        ----------
+        params_dict : dict
+            Parameter values (estimated params only, e.g. beta, kappa, ...).
+        omega_pc : float
+            Current-period credibility forward weight.
+
+        Returns
+        -------
+        A, B, C : ndarray (n, n)
+        """
+        args = _param_args(params_dict) + [omega_pc]
+        A = np.array(func_A(*args), dtype=float)
+        B = np.array(func_B(*args), dtype=float)
+        C = np.array(func_C(*args), dtype=float)
+        return A, B, C
+
+    def build_ABCD(params_dict, omega_pc):
+        """Build A, B, C, D, D_const at given parameters and omega_pc."""
+        args = _param_args(params_dict) + [omega_pc]
+        A = np.array(func_A(*args), dtype=float)
+        B = np.array(func_B(*args), dtype=float)
+        C = np.array(func_C(*args), dtype=float)
+        D = np.array(func_D(*args), dtype=float)
+        raw_const = np.atleast_1d(
+            np.array(func_D_const(*args), dtype=float)).flatten()
+        D_const = np.zeros(n)
+        if raw_const.size == n:
+            D_const[:] = raw_const
+        elif raw_const.size == 1:
+            D_const[:] = raw_const[0]
+        return A, B, C, D, D_const
+
+    # ---- Credibility stepping function (numpy-compatible) ----
+    cred_fn = cred['fn']
+    cred_state_vars = cred['state_vars']
+    cred_input_vars = cred['input_vars']
+    cred_output_vars = cred['output_vars']
+    cred_used_params = cred['used_params']
+
+    # Map input variables to column indices in u_path
+    var_names = model['var_names']
+    input_indices = {}
+    for v in cred_input_vars:
+        if v in var_names:
+            input_indices[v] = var_names.index(v)
+        else:
+            raise ValueError(
+                f"Credibility input '{v}' not in model var_names. "
+                f"Available: {var_names}")
+
+    def compute_omega_path(u_path, params_dict, cred_init=1.0):
+        """Compute the continuous omega path from a simulated u_path.
+
+        Runs the credibility law of motion forward through the path,
+        extracting input variables (e.g. pi_cpi_yoy) from u_path at
+        each period.
+
+        Parameters
+        ----------
+        u_path : ndarray (T, n)
+            Simulated model path (deviations from SS).
+        params_dict : dict
+            Full parameter values (must include credibility params).
+        cred_init : float
+            Initial credibility state (default 1.0 = full credibility).
+
+        Returns
+        -------
+        omega_path : ndarray (T,)
+            Time-varying forward weight.
+        cred_path : ndarray (T,)
+            Credibility state path.
+        """
+        T = u_path.shape[0]
+        cred_path = np.zeros(T)
+        omega_path = np.zeros(T)
+
+        # Extract credibility parameters
+        cred_params = {p: params_dict[p] for p in cred_used_params}
+
+        # Initialize state
+        prev_state = {}
+        for v in cred_state_vars:
+            prev_state[v] = np.array(
+                cred_init if v == 'cred_state' else 0.0)
+
+        for t in range(T):
+            # Extract inputs from model path
+            inputs = {v: np.array(float(u_path[t, input_indices[v]]))
+                      for v in cred_input_vars}
+
+            # Run one credibility step
+            outputs, new_state = cred_fn(inputs, prev_state, cred_params)
+
+            # Record
+            cred_path[t] = float(new_state.get('cred_state', cred_init))
+            omega_path[t] = float(outputs.get(cred_output_vars[0],
+                                               params_dict.get('omega_high', 1.0)))
+
+            prev_state = new_state
+
+        return omega_path, cred_path
+
+    def solve_irf(shock_name, size=1.0, T=60, params_dict=None,
+                  cred_init=1.0, max_outer=50, tol=1e-8):
+        """Compute an impulse response with continuous credibility dynamics.
+
+        Uses the Pontus outer loop: backward recurse with per-period
+        matrices A(omega_t), B(omega_t), C(omega_t), forward simulate,
+        update the omega path from the credibility dynamics, repeat
+        until the omega path converges.
+
+        Parameters
+        ----------
+        shock_name : str
+            Name of the shock (must be in shock_names).
+        size : float
+            Shock size (in units of the shock, not std devs).
+        T : int
+            IRF horizon.
+        params_dict : dict or None
+            Parameter values. If None, uses param_defaults.
+        cred_init : float
+            Initial credibility state.
+        max_outer : int
+            Maximum outer iterations.
+        tol : float
+            Convergence tolerance on max|omega_new - omega_old|.
+
+        Returns
+        -------
+        result : dict with keys:
+            'u_path'     : ndarray (T, n) -- IRF path
+            'omega_path' : ndarray (T,) -- converged omega path
+            'cred_path'  : ndarray (T,) -- converged credibility path
+            'converged'  : bool
+            'outer_iters': int
+            'F_path'     : ndarray (T, n, n) -- policy functions
+        """
+        from necredpy.pontus import (solve_terminal,
+                                     backward_recursion_continuous,
+                                     simulate_forward_with_shocks)
+
+        if params_dict is None:
+            params_dict = dict(model['param_defaults'])
+
+        shock_names = model['shock_names']
+        if shock_name not in shock_names:
+            raise ValueError(
+                f"Unknown shock '{shock_name}'. "
+                f"Available: {shock_names}")
+        shock_idx = shock_names.index(shock_name)
+        n_shocks = len(shock_names)
+
+        # Build shock sequence: unit impulse at t=0
+        epsilon = np.zeros((T, n_shocks))
+        epsilon[0, shock_idx] = size
+
+        # Terminal regime: full credibility (omega = omega_high)
+        omega_high = params_dict.get('omega_high', 1.0)
+        A_H, B_H, C_H = build_ABC(params_dict, omega_high)
+        F_terminal, _ = solve_terminal(A_H, B_H, C_H)
+
+        # Initial guess: constant omega = omega_high (full credibility)
+        omega_path = np.full(T, omega_high)
+
+        for outer in range(max_outer):
+            # Build per-period matrices
+            A_all = np.zeros((T, n, n))
+            B_all = np.zeros((T, n, n))
+            C_all = np.zeros((T, n, n))
+            D_all = np.zeros((T, n, n_shocks))
+            D_const_all = np.zeros((T, n))
+
+            for t in range(T):
+                A_t, B_t, C_t, D_t, Dc_t = build_ABCD(
+                    params_dict, omega_path[t])
+                A_all[t] = A_t
+                B_all[t] = B_t
+                C_all[t] = C_t
+                D_all[t] = D_t
+                D_const_all[t] = Dc_t
+
+            # Backward recursion with per-period matrices
+            F_path, E_path, Q_path = backward_recursion_continuous(
+                A_all, B_all, C_all, D_const_all, F_terminal)
+
+            # Forward simulate
+            # Impact: Q_t maps into state space, D_t maps shocks
+            u_path = simulate_forward_with_shocks(
+                F_path, E_path, Q_path, D_all, epsilon)
+
+            # Compute new omega path from credibility dynamics
+            omega_new, cred_path = compute_omega_path(
+                u_path, params_dict, cred_init=cred_init)
+
+            # Check convergence
+            max_diff = np.max(np.abs(omega_new - omega_path))
+            if verbose:
+                print(f"  PWL outer {outer + 1}: "
+                      f"max|d_omega| = {max_diff:.2e}, "
+                      f"cred range = [{cred_path.min():.4f}, "
+                      f"{cred_path.max():.4f}]")
+
+            if max_diff < tol:
+                return {
+                    'u_path': u_path,
+                    'omega_path': omega_new,
+                    'cred_path': cred_path,
+                    'converged': True,
+                    'outer_iters': outer + 1,
+                    'F_path': F_path,
+                }
+
+            omega_path = omega_new
+
+        return {
+            'u_path': u_path,
+            'omega_path': omega_path,
+            'cred_path': cred_path,
+            'converged': False,
+            'outer_iters': max_outer,
+            'F_path': F_path,
+        }
+
+    # ---- Assemble result ----
+    if verbose:
+        print(f"_compile_pwl: {len(var_names)} vars, "
+              f"{len(model['shock_names'])} shocks, "
+              f"coefficients = {coeff_names}")
+        print(f"  credibility inputs:  {cred_input_vars}")
+        print(f"  credibility outputs: {cred_output_vars}")
+        print(f"  credibility states:  {cred_state_vars}")
+        print(f"  credibility params:  {cred_used_params}")
+
+    return {
+        'target': 'pwl',
+        'func_A': func_A,
+        'func_B': func_B,
+        'func_C': func_C,
+        'func_D': func_D,
+        'func_D_const': func_D_const,
+        'build_ABC': build_ABC,
+        'build_ABCD': build_ABCD,
+        'var_names': var_names,
+        'shock_names': model['shock_names'],
+        'param_names': param_names,
+        'param_defaults': model['param_defaults'],
+        'coefficient_names': coeff_names,
+        'credibility_fn': cred_fn,
+        'credibility_info': {
+            'state_vars': cred_state_vars,
+            'input_vars': cred_input_vars,
+            'output_vars': cred_output_vars,
+            'used_params': cred_used_params,
+        },
+        'compute_omega_path': compute_omega_path,
+        'solve_irf': solve_irf,
+        'aux_resolution': model.get('aux_resolution', {}),
+        'monitor_resolution': model.get('monitor_resolution', {}),
+    }
 
 
 def _compile_nn(parsed, verbose=False):
