@@ -105,7 +105,13 @@ def discover_forward_vars(model, params=None, tol=1e-10):
         Variable names corresponding to fwd_idx.
     """
     p = _default_params(model, params)
-    _, _, C = model["build_ABC"](p)
+    coeff_names = model.get("coefficient_names", [])
+    if coeff_names:
+        # New grammar: pass omega at full credibility for sparsity check
+        omega_high = float(p.get("omega_high", 1.0))
+        _, _, C = model["build_ABC"](p, omega_high)
+    else:
+        _, _, C = model["build_ABC"](p)
     C_np = jnp.asarray(C)
     n = C_np.shape[1]
     raw = []
@@ -180,12 +186,20 @@ def resolve_state(u_lag, E_fwd_next, eps_t, model, params,
     if fwd_idx is None:
         fwd_idx, _ = discover_forward_vars(model, params)
 
-    p = dict(params)
-    if omega_t is not None:
+    coeff_names = model.get("coefficient_names", [])
+    if coeff_names and omega_t is not None:
+        # New grammar: omega_pc is a coefficient, not a parameter
+        A, B, C = model["build_ABC"](params, omega_t)
+        D = model["build_D"](params, omega_t)
+    elif omega_t is not None:
+        # Legacy: stuff omega into params dict
+        p = dict(params)
         p["omega"] = omega_t
-
-    A, B, C = model["build_ABC"](p)
-    D = model["build_D"](p)
+        A, B, C = model["build_ABC"](p)
+        D = model["build_D"](p)
+    else:
+        A, B, C = model["build_ABC"](params)
+        D = model["build_D"](params)
 
     n = u_lag.shape[0]
     u_next = jnp.zeros(n).at[fwd_idx].set(E_fwd_next)
@@ -206,12 +220,18 @@ def equation_residuals(u_lag, u_t, u_next, eps_t, model, params,
     resolved (u_lag, u_t, u_next, eps_t) this is zero up to float
     roundoff. Useful as a sanity check during training.
     """
-    p = dict(params)
-    if omega_t is not None:
+    coeff_names = model.get("coefficient_names", [])
+    if coeff_names and omega_t is not None:
+        A, B, C = model["build_ABC"](params, omega_t)
+        D = model["build_D"](params, omega_t)
+    elif omega_t is not None:
+        p = dict(params)
         p["omega"] = omega_t
-
-    A, B, C = model["build_ABC"](p)
-    D = model["build_D"](p)
+        A, B, C = model["build_ABC"](p)
+        D = model["build_D"](p)
+    else:
+        A, B, C = model["build_ABC"](params)
+        D = model["build_D"](params)
     # Sign convention: parser stores D as -(coeff of e_t), so the
     # equation residual is A u_lag + B u_t + C u_next - D eps_t.
     return A @ u_lag + B @ u_t + C @ u_next - D @ eps_t
@@ -250,23 +270,31 @@ def update_credibility(monitor_lag, cred_lag, model, params):
         Credibility-scaled forward weight,
         omega_t = omega_L + (omega_H - omega_L) * cred_t.
     """
-    if model.get("credibility_jax") is None:
+    cred_new = model.get("credibility_new")
+    cred_jax = model.get("credibility_jax")
+
+    if cred_new is None and cred_jax is None:
         # No credibility regime in the model. Treat as fully linear:
         # cred is constant 1, omega is the constant value in params
         # (or 1.0 if the model has no omega parameter at all).
-        omega_const = float(params.get("omega", 1.0))
+        omega_const = float(params.get("omega",
+                            params.get("omega_high", 1.0)))
         return jnp.array(1.0), jnp.array(omega_const)
 
     from necredpy.jax_model import _build_cred_scan_fn
 
-    cred_scan_fn, _ = _build_cred_scan_fn(model, params)
-    # The scan function takes (carry, pi_t) where carry = (cred, pi_lag).
-    # Run for one step, treating the input as the contemporaneous monitor.
-    init_carry = (cred_lag, monitor_lag)
-    new_carry, cred_t = cred_scan_fn(init_carry, monitor_lag)
-    omega_H = params["omega_H"]
-    omega_L = params["omega_L"]
-    omega_t = omega_L + (omega_H - omega_L) * cred_t
+    cred_scan_fn, init_template = _build_cred_scan_fn(model, params)
+
+    if cred_new is not None:
+        # New grammar: carry is a dict {'cred_state': ...}
+        carry = {v: (cred_lag if v == 'cred_state' else jnp.array(0.0))
+                 for v in cred_new['state_vars']}
+        new_carry, (cred_t, omega_t) = cred_scan_fn(carry, monitor_lag)
+    else:
+        # Legacy: carry is (cred, pi_lag) tuple
+        carry = (cred_lag, monitor_lag)
+        new_carry, (cred_t, omega_t) = cred_scan_fn(carry, monitor_lag)
+
     return cred_t, omega_t
 
 

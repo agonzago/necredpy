@@ -605,7 +605,7 @@ def parse_mod(mod_string, verbose=False, coefficient_names=None):
 
     for eq_i, owner in eq_owner.items():
         # Skip if this equation has a shock: the owner is not resolvable
-        # from data alone. Parameter-dependent coefficients are OK.
+        # from data alone.
         if any(sympy_D[eq_i, k] != 0 for k in range(num_shocks)):
             continue
         # Skip if the equation has any forward expectation.
@@ -620,6 +620,16 @@ def parse_mod(mod_string, verbose=False, coefficient_names=None):
             continue
         # Collect dependencies: contemporaneous (lag 0) from B, lagged
         # (lag -1) from A. Skip self-reference at lag 0.
+        # If ANY coefficient is parameter-dependent (not purely numeric),
+        # skip the entire equation. The owner becomes a "source" node
+        # that must be observed directly. This prevents the resolution
+        # graph from walking through equations like
+        #   pi_cpi = pi_dom + f(alpha_m)*(q - q(-1))
+        # where the coefficients depend on parameters. Variables like
+        # pi_cpi_yoy that reference pi_cpi will stop at pi_cpi (source)
+        # rather than trying to resolve further through pi_cpi.
+        edges = []
+        has_param_dep = False
         for k in range(num_vars):
             if k == j:
                 continue
@@ -629,8 +639,11 @@ def parse_mod(mod_string, verbose=False, coefficient_names=None):
             try:
                 w = float(-coeff / b_jj)
             except (TypeError, ValueError):
-                w = None  # parameter-dependent; unresolvable
-            dep_graph.add_edge(owner, var_names[k], lag=0, weight=w)
+                has_param_dep = True
+                break
+            edges.append((owner, var_names[k], 0, w))
+        if has_param_dep:
+            continue
         for k in range(num_vars):
             coeff = sympy_A[eq_i, k]
             if coeff == 0:
@@ -638,8 +651,13 @@ def parse_mod(mod_string, verbose=False, coefficient_names=None):
             try:
                 w = float(-coeff / b_jj)
             except (TypeError, ValueError):
-                w = None
-            dep_graph.add_edge(owner, var_names[k], lag=-1, weight=w)
+                has_param_dep = True
+                break
+            edges.append((owner, var_names[k], -1, w))
+        if has_param_dep:
+            continue
+        for src, dst, lag, w in edges:
+            dep_graph.add_edge(src, dst, lag=lag, weight=w)
 
     if verbose:
         print(f"Dependency graph: {dep_graph.number_of_nodes()} nodes, "
