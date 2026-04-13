@@ -263,13 +263,16 @@ def _build_cred_scan_fn(model, params):
         input_vars = cred_new['input_vars']
         output_vars = cred_new['output_vars']
         used_params = cred_new['used_params']
+        lagged_input_vars = cred_new.get('lagged_input_vars', [])
 
         # Pre-extract credibility parameters (closed over, not re-read)
         cred_params = {p: params[p] for p in used_params}
 
-        # Initial state: full credibility
+        # Initial state: full credibility + lagged inputs at SS (0.0)
         init_state = {v: jnp.array(1.0) if v == 'cred_state'
                       else jnp.array(0.0) for v in state_vars}
+        for v in lagged_input_vars:
+            init_state[v] = jnp.array(0.0)
 
         def cred_scan_fn(carry, monitor_t):
             prev_state = carry
@@ -278,6 +281,8 @@ def _build_cred_scan_fn(model, params):
                                                 cred_params)
             omega_t = outputs[output_vars[0]]
             cred_t = new_state.get('cred_state', jnp.array(1.0))
+            # new_state already includes current inputs for lagged-input
+            # support (propagated by credibility_fn)
             return new_state, (cred_t, omega_t)
 
         return cred_scan_fn, init_state

@@ -286,9 +286,12 @@ def update_credibility(monitor_lag, cred_lag, model, params):
     cred_scan_fn, init_template = _build_cred_scan_fn(model, params)
 
     if cred_new is not None:
-        # New grammar: carry is a dict {'cred_state': ...}
+        # New grammar: carry is a dict {'cred_state': ..., <lagged_inputs>: ...}
         carry = {v: (cred_lag if v == 'cred_state' else jnp.array(0.0))
                  for v in cred_new['state_vars']}
+        # Include lagged inputs in carry (they propagate through prev_state)
+        for v in cred_new.get('lagged_input_vars', []):
+            carry[v] = monitor_lag  # best available: current monitor as lag
         new_carry, (cred_t, omega_t) = cred_scan_fn(carry, monitor_lag)
     else:
         # Legacy: carry is (cred, pi_lag) tuple

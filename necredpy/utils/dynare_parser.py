@@ -1716,15 +1716,22 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
     param_names_set = set(param_names) if param_names else None
 
     # ---- Identify state vars (locals that appear with (-1) lag) ----
+    # Also identify lagged inputs: input vars referenced with (-1).
+    # These are carried forward in prev_state alongside internal states.
     lag_regex = re.compile(r'\b([a-zA-Z_]\w*)\s*\(\s*-1\s*\)')
     state_set = set()
+    lagged_input_set = set()
+    input_var_set = set(input_vars)
     for eq in equations:
         for m in lag_regex.finditer(eq['rhs']):
             name = m.group(1)
             if name in local_vars:
                 state_set.add(name)
+            elif name in input_var_set:
+                lagged_input_set.add(name)
     state_vars     = [v for v in local_vars if v in state_set]
     algebraic_vars = [v for v in local_vars if v not in state_set]
+    lagged_input_vars = sorted(lagged_input_set)
 
     # ---- Build sympy symbols ----
     # Inputs:      <name>           (comes from inputs dict at runtime)
@@ -1737,6 +1744,9 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
     sym_inputs = {v: sympy.Symbol(v)           for v in input_vars}
     sym_prev   = {v: sympy.Symbol(f"{v}_m1")   for v in state_vars}
     sym_local  = {v: sympy.Symbol(v)           for v in local_vars}
+    # Lagged inputs: input(-1) -> input_m1 in the expression tree.
+    # At runtime these come from prev_state (same as state var lags).
+    sym_lagged_inputs = {v: sympy.Symbol(f"{v}_m1") for v in lagged_input_vars}
 
     # Name-collision guard: an input and a local must never share a name
     collisions = set(input_vars) & set(local_vars)
@@ -1786,14 +1796,15 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
             name = m.group(1)
             if name in state_set:
                 return f"{name}_m1"
-            # Lagged references to NON-state locals or to inputs are
-            # not supported inside the credibility block (inputs have no
-            # lag; locals are computed within one period). Flag them.
+            if name in lagged_input_set:
+                return f"{name}_m1"
+            # Lagged references to NON-state locals are not supported
+            # (locals are computed within one period).
             raise ValueError(
                 f"Credibility equation {eq_idx} ({lhs}): cannot take "
                 f"lag (-1) of {name!r}. Only declared local variables "
-                f"that themselves carry a (-1) lag somewhere in the "
-                f"block are allowed as states.")
+                f"that carry a (-1) lag, or input variables, are "
+                f"allowed with lags.")
         rhs_str = lag_regex.sub(_sub_lag, eq['rhs'])
 
         # Build the local_dict for sympify. We include ALL known symbols
@@ -1803,6 +1814,7 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
         local_dict = {}
         local_dict.update(sym_inputs)
         local_dict.update({f"{v}_m1": sym_prev[v] for v in state_vars})
+        local_dict.update({f"{v}_m1": sym_lagged_inputs[v] for v in lagged_input_vars})
         local_dict.update(sym_local)
         # Math functions
         local_dict['exp']     = sympy.exp
@@ -1824,11 +1836,14 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
         used_syms = rhs_expr.free_symbols
         used_inputs = [v for v in input_vars if sym_inputs[v] in used_syms]
         used_prev   = [v for v in state_vars if sym_prev[v]   in used_syms]
+        used_lagged_inputs = [v for v in lagged_input_vars
+                              if sym_lagged_inputs[v] in used_syms]
         used_locals = [v for v in local_vars if sym_local[v]  in used_syms]
 
         # Auto-discover parameters: any free symbol not in locals/inputs/prev
         known_syms = (set(sym_inputs.values())
                       | set(sym_prev.values())
+                      | set(sym_lagged_inputs.values())
                       | set(sym_local.values()))
         unknown_syms = used_syms - known_syms
         used_params = []
@@ -1859,6 +1874,7 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
         arg_list = (
             [sym_inputs[v] for v in used_inputs]
             + [sym_prev[v]   for v in used_prev]
+            + [sym_lagged_inputs[v] for v in used_lagged_inputs]
             + [param_sym_map[v] for v in used_params]
             + [sym_local[v]  for v in used_locals]
         )
@@ -1870,6 +1886,7 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
             'fn':          fn,
             'used_inputs': used_inputs,
             'used_prev':   used_prev,
+            'used_lagged_inputs': used_lagged_inputs,
             'used_params': used_params,
             'used_locals': used_locals,
             'rhs_expr':    rhs_expr,
@@ -1914,6 +1931,7 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
             args = (
                 [inputs[v]     for v in ceq['used_inputs']]
                 + [prev_state[v] for v in ceq['used_prev']]
+                + [prev_state[v] for v in ceq['used_lagged_inputs']]
                 + [params[v]     for v in ceq['used_params']]
                 + [locals_dict[v] for v in ceq['used_locals']]
             )
@@ -1921,6 +1939,10 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
 
         outputs   = {v: locals_dict[v] for v in output_vars}
         new_state = {v: locals_dict[v] for v in state_vars}
+        # Propagate current inputs to new_state so the caller can
+        # pass them as prev_state next period (for lagged inputs).
+        for v in lagged_input_vars:
+            new_state[v] = inputs[v]
         return outputs, new_state
 
     used_params_list = sorted(all_used_params)
@@ -1929,6 +1951,7 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
         print(f"compile_credibility_block:")
         print(f"  state_vars     ({len(state_vars)}):     {state_vars}")
         print(f"  algebraic_vars ({len(algebraic_vars)}): {algebraic_vars}")
+        print(f"  lagged_inputs  ({len(lagged_input_vars)}):  {lagged_input_vars}")
         print(f"  used_params    ({len(used_params_list)}):    {used_params_list}")
 
     return {
@@ -1937,6 +1960,7 @@ def compile_credibility_block(spec, param_names=None, verbose=False):
         'algebraic_vars':  algebraic_vars,
         'input_vars':      input_vars,
         'output_vars':     output_vars,
+        'lagged_input_vars': lagged_input_vars,
         'used_params':     used_params_list,
         'equations_debug': compiled_eqs,
     }
@@ -2714,6 +2738,7 @@ def _compile_pwl(parsed, verbose=False):
     cred_input_vars = cred['input_vars']
     cred_output_vars = cred['output_vars']
     cred_used_params = cred['used_params']
+    cred_lagged_input_vars = cred.get('lagged_input_vars', [])
 
     # Map input variables to column indices in u_path
     var_names = model['var_names']
@@ -2756,11 +2781,14 @@ def _compile_pwl(parsed, verbose=False):
         # Extract credibility parameters
         cred_params = {p: params_dict[p] for p in cred_used_params}
 
-        # Initialize state
+        # Initialize state (internal credibility + lagged inputs)
         prev_state = {}
         for v in cred_state_vars:
             prev_state[v] = np.array(
                 cred_init if v == 'cred_state' else 0.0)
+        # Lagged inputs start at 0.0 (deviation space: on target)
+        for v in cred_lagged_input_vars:
+            prev_state[v] = np.array(0.0)
 
         for t in range(T):
             # Extract inputs from model path
@@ -2768,6 +2796,8 @@ def _compile_pwl(parsed, verbose=False):
                       for v in cred_input_vars}
 
             # Run one credibility step
+            # (credibility_fn propagates current inputs into new_state
+            #  for lagged-input support at the next period)
             outputs, new_state = cred_fn(inputs, prev_state, cred_params)
 
             # Record
@@ -2930,6 +2960,7 @@ def _compile_pwl(parsed, verbose=False):
             'state_vars': cred_state_vars,
             'input_vars': cred_input_vars,
             'output_vars': cred_output_vars,
+            'lagged_input_vars': cred_lagged_input_vars,
             'used_params': cred_used_params,
         },
         'compute_omega_path': compute_omega_path,
