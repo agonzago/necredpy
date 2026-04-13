@@ -4,33 +4,25 @@ High-level Model interface for necredpy.
 Usage:
     from necredpy import Model
 
-    m = Model("dynare/five_sector_network.mod")
-    irf = m.irf("eps_pi1", size=3.0)
-    irf["pi_agg"].plot()
-
-    m = Model("dynare/credibility_nk_regimes.mod")
-    results = m.estimate(data, obs_vars=["y", "pi", "i"])
+    m = Model("dynare/network_soe_cred.mod")
+    results = m.estimate(data, obs_vars=[...], shock_vars=[...])
 """
 
-import copy
 import os
 
 import numpy as np
 import pandas as pd
 
-from necredpy.pontus import (
-    solve_terminal, backward_recursion, simulate_forward, solve_endogenous,
-)
 from necredpy.utils.dynare_parser import (
-    parse_two_regime_model, get_model_matrices, build_switching_fn,
-    compile_two_regime_model, evaluate_two_regime_model,
     extract_priors, build_numpyro_prior_fn,
-    build_credibility_switching_fn,
 )
 
 
 class Model:
     """High-level interface for DSGE/QPM models with endogenous credibility.
+
+    Uses compile_jax_model (new credibility grammar with var/input/output
+    declarations) as the single compilation path.
 
     Parameters
     ----------
@@ -46,32 +38,17 @@ class Model:
         self._mod_file = os.path.abspath(mod_file)
         self._param_overrides = param_overrides or {}
 
-        # Compile once (expensive sympy step)
-        self._compiled = compile_two_regime_model(self._mod_string)
-        self._regime_spec = self._compiled.get('regime_spec_raw')
-        parsed = self._compiled['parsed']
+        # Single compilation path: compile_jax_model handles the new
+        # credibility grammar (var/input/output) and model(pwl/nn).
+        from necredpy.jax_model import compile_jax_model
+        self._jax_model = compile_jax_model(self._mod_string)
 
-        self.var_names = parsed['var_names']
-        self.shock_names = parsed['shock_names']
-        self.param_names = parsed['param_names']
-        self.param_defaults = dict(parsed['param_defaults'])
-        self.n_vars = len(self.var_names)
-        self.n_shocks = len(self.shock_names)
-
-        # Evaluate at default params to cache regime matrices
-        self._evaluate()
-
-    def _evaluate(self, param_overrides=None):
-        """Evaluate regime matrices at current (or given) parameter values."""
-        overrides = dict(self._param_overrides)
-        if param_overrides:
-            overrides.update(param_overrides)
-        M1, M2, sw, info = evaluate_two_regime_model(
-            self._compiled, param_overrides=overrides)
-        self._M1 = M1
-        self._M2 = M2
-        self._info = info
-        return info
+        self.var_names = self._jax_model['var_names']
+        self.shock_names = self._jax_model['shock_names']
+        self.param_names = self._jax_model['param_names']
+        self.param_defaults = dict(self._jax_model['param_defaults'])
+        self.n_vars = self._jax_model['n_vars']
+        self.n_shocks = self._jax_model['n_shocks']
 
     @property
     def params(self):
@@ -79,187 +56,6 @@ class Model:
         p = dict(self.param_defaults)
         p.update(self._param_overrides)
         return p
-
-    # ------------------------------------------------------------------
-    # IRF
-    # ------------------------------------------------------------------
-
-    def irf(self, shock_name, size=1.0, T=60, credibility=False,
-            cred_init=None, param_overrides=None):
-        """Compute impulse response function.
-
-        Parameters
-        ----------
-        shock_name : str
-            Name of the shock (e.g., 'eps_pi1'). Must match a varexo in
-            the .mod file.
-        size : float
-            Shock size at t=0.
-        T : int
-            Simulation horizon (quarters).
-        credibility : bool
-            If False, solve single-regime linear model.
-            If True, solve with endogenous credibility switching.
-        cred_init : float or None
-            Initial credibility level (default from .mod file, usually 1.0).
-            Only used when credibility=True.
-        param_overrides : dict or None
-            Temporary parameter overrides for this IRF only.
-
-        Returns
-        -------
-        pandas.DataFrame
-            Columns: variable names + 'regime' and 'credibility' (when
-            credibility=True). Index: quarters 0..T-1.
-        """
-        info = self._evaluate(param_overrides)
-        vn = info['var_names']
-        sn = info['shock_names']
-        n = len(vn)
-
-        # Build shock vector
-        si = sn.index(shock_name)
-        eps = np.zeros((T, n))
-        eps[0, :] = -info['D_shock'][:, si] * size
-
-        if not credibility:
-            # Single-regime linear solve
-            A, B, C, D = self._M1
-            F, Q = solve_terminal(A, B, C)
-            u = simulate_forward(
-                np.tile(F, (T, 1, 1)),
-                np.zeros((T, n)),
-                np.tile(Q, (T, 1, 1)),
-                eps,
-            )
-            df = pd.DataFrame(u, columns=vn)
-            return df
-
-        # Piecewise-linear with credibility switching
-        cred_compiled = info.get('credibility_compiled')
-        if cred_compiled is not None:
-            if cred_init is not None:
-                cred_compiled = copy.deepcopy(cred_compiled)
-                cred_compiled['cred_init'] = cred_init
-            regime_spec = info.get('regime_spec', {})
-            band = regime_spec.get('band') if regime_spec else None
-            sw = build_credibility_switching_fn(
-                cred_compiled, vn, info['params_M1'], band=band)
-        else:
-            regime_spec = copy.deepcopy(info['regime_spec'])
-            if cred_init is not None:
-                regime_spec['cred_init'] = cred_init
-            sw = build_switching_fn(regime_spec, vn)
-
-        u, reg, _, _, _, conv, iters = solve_endogenous(
-            self._M1, self._M2, sw, eps, T)
-
-        df = pd.DataFrame(u, columns=vn)
-        df['regime'] = reg
-        if hasattr(sw, 'cred_path') and sw.cred_path is not None:
-            df['credibility'] = sw.cred_path
-        return df
-
-    # ------------------------------------------------------------------
-    # Simulate (general: custom shock sequences)
-    # ------------------------------------------------------------------
-
-    def simulate(self, shocks, T=None, credibility=False, cred_init=None,
-                 param_overrides=None):
-        """Simulate the model with a custom shock sequence.
-
-        Parameters
-        ----------
-        shocks : dict or pandas.DataFrame or ndarray
-            Shock sequence. Can be:
-            - dict mapping shock names to 1-D arrays:
-              {'eps_pi1': [3.0, 0, 0, ...], 'eps_m': [0, 0.5, ...]}
-            - DataFrame with shock names as columns
-            - ndarray of shape (T, n_shocks) in varexo order
-        T : int or None
-            Simulation horizon. Inferred from shocks if None.
-        credibility : bool
-            If True, solve with endogenous credibility switching.
-        cred_init : float or None
-            Initial credibility level.
-        param_overrides : dict or None
-            Temporary parameter overrides.
-
-        Returns
-        -------
-        pandas.DataFrame
-        """
-        info = self._evaluate(param_overrides)
-        vn = info['var_names']
-        sn = info['shock_names']
-        n = len(vn)
-
-        # Parse shocks into (T, n_vars) array
-        if isinstance(shocks, pd.DataFrame):
-            if T is None:
-                T = len(shocks)
-            eps_active = np.zeros((T, len(sn)))
-            for i, s in enumerate(sn):
-                if s in shocks.columns:
-                    vals = shocks[s].values
-                    eps_active[:len(vals), i] = vals[:T]
-        elif isinstance(shocks, dict):
-            lengths = [len(v) for v in shocks.values()]
-            if T is None:
-                T = max(lengths) if lengths else 60
-            eps_active = np.zeros((T, len(sn)))
-            for i, s in enumerate(sn):
-                if s in shocks:
-                    vals = np.asarray(shocks[s])
-                    eps_active[:len(vals), i] = vals[:T]
-        else:
-            # ndarray (T, n_shocks)
-            shocks = np.asarray(shocks)
-            if T is None:
-                T = shocks.shape[0]
-            eps_active = np.zeros((T, len(sn)))
-            eps_active[:shocks.shape[0], :shocks.shape[1]] = shocks[:T]
-
-        # Map active shocks into full state-space shock vector
-        D_shock = info['D_shock']
-        eps = np.zeros((T, n))
-        for t in range(T):
-            eps[t, :] = -D_shock @ eps_active[t]
-
-        if not credibility:
-            A, B, C, D = self._M1
-            F, Q = solve_terminal(A, B, C)
-            u = simulate_forward(
-                np.tile(F, (T, 1, 1)),
-                np.zeros((T, n)),
-                np.tile(Q, (T, 1, 1)),
-                eps,
-            )
-            return pd.DataFrame(u, columns=vn)
-
-        cred_compiled = info.get('credibility_compiled')
-        if cred_compiled is not None:
-            if cred_init is not None:
-                cred_compiled = copy.deepcopy(cred_compiled)
-                cred_compiled['cred_init'] = cred_init
-            regime_spec = info.get('regime_spec', {})
-            band = regime_spec.get('band') if regime_spec else None
-            sw = build_credibility_switching_fn(
-                cred_compiled, vn, info['params_M1'], band=band)
-        else:
-            regime_spec = copy.deepcopy(info['regime_spec'])
-            if cred_init is not None:
-                regime_spec['cred_init'] = cred_init
-            sw = build_switching_fn(regime_spec, vn)
-
-        u, reg, _, _, _, conv, iters = solve_endogenous(
-            self._M1, self._M2, sw, eps, T)
-
-        df = pd.DataFrame(u, columns=vn)
-        df['regime'] = reg
-        if hasattr(sw, 'cred_path') and sw.cred_path is not None:
-            df['credibility'] = sw.cred_path
-        return df
 
     # ------------------------------------------------------------------
     # Estimate
@@ -316,12 +112,9 @@ class Model:
         if num_chains > 1:
             numpyro.set_host_device_count(num_chains)
 
-        from necredpy.jax_model import (
-            compile_jax_model, inversion_filter_partial, solve_terminal_jax,
-        )
+        from necredpy.jax_model import inversion_filter_partial
 
-        # Compile JAX model
-        jax_model = compile_jax_model(self._mod_string)
+        jax_model = self._jax_model
         priors = extract_priors(self._mod_string)
         if not priors:
             raise ValueError("No priors block found in .mod file. "
@@ -355,7 +148,7 @@ class Model:
             sampled = sample_priors_fn()
             params = {k: v for k, v in true_params.items()}
             params.update(sampled)
-            ll, _, _, _ = inversion_filter_partial(
+            ll, _, _, _, _, _, _ = inversion_filter_partial(
                 jax_model, obs_partial, params,
                 obs_indices=obs_indices,
                 shock_indices=shock_indices)
@@ -382,7 +175,7 @@ class Model:
             if name in samples:
                 post_mean_params[name] = float(jnp.mean(samples[name]))
 
-        ll_post, _, cred_post, _ = inversion_filter_partial(
+        ll_post, _, cred_post, _, _, _, _ = inversion_filter_partial(
             jax_model, obs_partial, post_mean_params,
             obs_indices=obs_indices,
             shock_indices=shock_indices)

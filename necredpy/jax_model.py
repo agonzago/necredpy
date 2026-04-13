@@ -107,137 +107,6 @@ def solve_terminal_jax(A, B, C, n_iter=25, tol=1e-12):
     return F
 
 
-# ---------------------------------------------------------------------------
-# Sigmoid credibility
-# ---------------------------------------------------------------------------
-
-def smooth_miss(pi, epsilon_bar, tau):
-    """miss_t = sigmoid((pi_t^2 - epsilon_bar^2) / tau)."""
-    return jax.nn.sigmoid((pi**2 - epsilon_bar**2) / tau)
-
-
-def credibility_step(cred, pi_t, epsilon_bar, tau, delta_up, delta_down):
-    """One step of the credibility law of motion.
-
-    cred_t = cred_{t-1} + delta_up*(1-cred_{t-1})*(1-miss_t)
-                         - delta_down*cred_{t-1}*miss_t
-    """
-    miss_t = smooth_miss(pi_t, epsilon_bar, tau)
-    cred_new = cred + delta_up * (1.0 - cred) * (1.0 - miss_t) \
-                    - delta_down * cred * miss_t
-    return jnp.clip(cred_new, 0.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# Pluggable credibility: JAX-compiled signal and accumulation functions
-# ---------------------------------------------------------------------------
-
-def compile_credibility_fn_jax(cred_spec, param_names):
-    """Compile credibility signal/accumulation expressions for JAX.
-
-    Same as compile_credibility_fn() in dynare_parser.py but targets JAX
-    so the functions are differentiable and JIT-compilable.
-
-    Parameters
-    ----------
-    cred_spec : dict
-        Output of extract_credibility().
-    param_names : list of str
-        All parameter names from the .mod file.
-
-    Returns
-    -------
-    compiled : dict with keys:
-        'signal_fn_jax'       : callable or None
-        'signal_params'       : list of str (param names used in signal)
-        'accumulation_fn_jax' : callable or None
-        'accumulation_params' : list of str (param names used in accumulation)
-        'monitor', 'threshold', 'cred_init', 'signal_lag' : from cred_spec
-    """
-    import sympy
-
-    compiled = {
-        'monitor': cred_spec['monitor'],
-        'threshold': cred_spec['threshold'],
-        'cred_init': cred_spec['cred_init'],
-        'signal_lag': cred_spec.get('signal_lag', 0),
-    }
-
-    jax_mod = [{'ImmutableDenseMatrix': jnp.array}, 'jax']
-
-    # ---- Signal function ----
-    sig_expr_str = cred_spec.get('signal_expr')
-
-    if sig_expr_str is None:
-        compiled['signal_fn_jax'] = None
-        compiled['signal_params'] = []
-    else:
-        expr_str = sig_expr_str.replace('pi(-1)', 'pi_lag')
-        expr_str = expr_str.replace('^', '**')
-
-        sym_pi = sympy.Symbol('pi')
-        sym_pi_lag = sympy.Symbol('pi_lag')
-        sym_pi_star = sympy.Symbol('pi_star')
-
-        param_syms = {p: sympy.Symbol(p) for p in param_names}
-        local_dict = {'pi': sym_pi, 'pi_lag': sym_pi_lag,
-                      'pi_star': sym_pi_star}
-        local_dict.update(param_syms)
-        local_dict['exp'] = sympy.exp
-        local_dict['log'] = sympy.log
-        local_dict['abs'] = sympy.Abs
-        local_dict['sqrt'] = sympy.sqrt
-
-        sym_expr = sympy.sympify(expr_str, locals=local_dict)
-
-        all_sym_names = {str(s) for s in sym_expr.free_symbols}
-        used_params = [p for p in param_names if p in all_sym_names]
-        compiled['signal_params'] = used_params
-
-        arg_list = [sym_pi, sym_pi_lag, sym_pi_star]
-        arg_list += [param_syms[p] for p in used_params]
-
-        compiled['signal_fn_jax'] = sympy.lambdify(
-            arg_list, sym_expr, modules=jax_mod)
-
-    # ---- Accumulation function ----
-    acc_expr_str = cred_spec.get('accumulation_expr')
-
-    if acc_expr_str is None:
-        compiled['accumulation_fn_jax'] = None
-        compiled['accumulation_params'] = []
-    else:
-        expr_str = acc_expr_str.replace('^', '**')
-
-        sym_cred = sympy.Symbol('cred')
-        sym_s = sympy.Symbol('s')
-        sym_miss = sympy.Symbol('miss')
-
-        param_syms = {p: sympy.Symbol(p) for p in param_names}
-        local_dict = {'cred': sym_cred, 's': sym_s, 'miss': sym_miss}
-        local_dict.update(param_syms)
-        local_dict['exp'] = sympy.exp
-        local_dict['log'] = sympy.log
-        local_dict['abs'] = sympy.Abs
-        local_dict['sqrt'] = sympy.sqrt
-        local_dict['max'] = sympy.Max
-        local_dict['min'] = sympy.Min
-
-        sym_expr = sympy.sympify(expr_str, locals=local_dict)
-
-        all_sym_names = {str(s) for s in sym_expr.free_symbols}
-        used_params = [p for p in param_names if p in all_sym_names]
-        compiled['accumulation_params'] = used_params
-
-        arg_list = [sym_cred, sym_s, sym_miss]
-        arg_list += [param_syms[p] for p in used_params]
-
-        compiled['accumulation_fn_jax'] = sympy.lambdify(
-            arg_list, sym_expr, modules=jax_mod)
-
-    return compiled
-
-
 def _build_cred_scan_fn(model, params):
     """Build the credibility scan function for lax.scan.
 
@@ -248,11 +117,9 @@ def _build_cred_scan_fn(model, params):
     so callers can always do:
         _, (cred_path, omega_path) = lax.scan(fn, init, obs_monitor)
 
-    Three paths (checked in order):
-      1. New grammar (credibility_new): self-contained credibility block
-         compiled from credibility; ... end; with JAX-traceable callable.
-      2. Legacy pluggable (credibility_jax): signal/accumulation expressions.
-      3. Hardcoded Isard: fallback with delta_up/delta_down.
+    Uses the new credibility grammar (credibility; ... end; block with
+    var/input/output declarations). Raises ValueError if no credibility
+    block is found.
     """
     cred_new = model.get('credibility_new')
 
@@ -287,71 +154,10 @@ def _build_cred_scan_fn(model, params):
 
         return cred_scan_fn, init_state
 
-    # ----- Path 2: Legacy pluggable credibility -----
-    cred_jax = model.get('credibility_jax')
-
-    if cred_jax is not None and (
-            cred_jax['signal_fn_jax'] is not None or
-            cred_jax['accumulation_fn_jax'] is not None):
-        signal_fn = cred_jax['signal_fn_jax']
-        acc_fn = cred_jax['accumulation_fn_jax']
-        signal_lag = cred_jax['signal_lag']
-        signal_params = cred_jax['signal_params']
-        acc_params = cred_jax['accumulation_params']
-        cred_init = cred_jax['cred_init']
-
-        sig_param_vals = [params[p] for p in signal_params]
-        acc_param_vals = [params[p] for p in acc_params]
-
-        epsilon_bar = params.get('epsilon_bar', 2.0)
-        tau = params.get('tau', 0.2)
-        omega_H = params['omega_H']
-        omega_L = params['omega_L']
-
-        def cred_scan_fn(carry, pi_t):
-            cred, pi_lag = carry
-
-            miss = jax.nn.sigmoid((pi_t**2 - epsilon_bar**2) / tau)
-
-            if signal_fn is not None:
-                pi_input = pi_lag if signal_lag == 1 else pi_t
-                sig = signal_fn(pi_t, pi_input, 0.0, *sig_param_vals)
-            else:
-                sig = 0.0
-
-            if acc_fn is not None:
-                cred_new = acc_fn(cred, sig, miss, *acc_param_vals)
-            else:
-                delta_up = params['delta_up']
-                delta_down = params['delta_down']
-                cred_new = (cred + delta_up * (1.0 - cred) * (1.0 - miss)
-                            - delta_down * cred * miss)
-
-            cred_new = jnp.clip(cred_new, 0.0, 1.0)
-            omega_t = omega_L + (omega_H - omega_L) * cred_new
-            return (cred_new, pi_t), (cred_new, omega_t)
-
-        init_carry = (cred_init, 0.0)
-        return cred_scan_fn, init_carry
-
-    else:
-        # ----- Path 3: Hardcoded Isard -----
-        delta_up = params['delta_up']
-        delta_down = params['delta_down']
-        epsilon_bar = params['epsilon_bar']
-        tau = params['tau']
-        omega_H = params['omega_H']
-        omega_L = params['omega_L']
-
-        def cred_scan_fn(carry, pi_t):
-            cred, pi_lag = carry
-            cred_new = credibility_step(cred, pi_t, epsilon_bar, tau,
-                                         delta_up, delta_down)
-            omega_t = omega_L + (omega_H - omega_L) * cred_new
-            return (cred_new, pi_t), (cred_new, omega_t)
-
-        init_carry = (1.0, 0.0)
-        return cred_scan_fn, init_carry
+    raise ValueError(
+        "No credibility block found. The .mod file must have a "
+        "credibility; ... end; block with var/input/output declarations."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -364,12 +170,9 @@ def compile_jax_model(mod_string, verbose=False):
     This is the expensive step (sympy parsing + lambdification).
     Call once at startup, then use the returned bundle for estimation.
 
-    Supports both the legacy credibility grammar (monitor:/signal=/
-    accumulation=) and the new credibility; ... end; block with explicit
-    var/input/output declarations.  Detection is automatic: if the .mod
-    file has a new-grammar credibility block AND model(pwl) or model(nn),
-    credibility outputs become time-varying coefficients (not estimated
-    parameters).  Otherwise the legacy path is used unchanged.
+    Uses the new credibility grammar (credibility; ... end; block with
+    var/input/output declarations). Credibility outputs (e.g. omega_pc)
+    become time-varying coefficients, not estimated parameters.
 
     Parameters
     ----------
@@ -387,16 +190,14 @@ def compile_jax_model(mod_string, verbose=False):
         'param_defaults'    : dict
         'n_vars'            : int
         'n_shocks'          : int
-        'coefficient_names' : list of str (e.g. ['omega_pc']; empty for legacy)
+        'coefficient_names' : list of str (e.g. ['omega_pc'])
         'regime_spec'       : dict or None (from regimes; block)
         'priors'            : list of dict (from priors; block)
-        'credibility_jax'   : dict or None (legacy JAX-compiled credibility)
-        'credibility_new'   : dict or None (new grammar compiled credibility)
+        'credibility_new'   : dict or None (compiled credibility block)
     """
     from necredpy.utils.dynare_parser import (parse_credibility_mod,
                                                jax_lambdify,
-                                               extract_regimes, extract_priors,
-                                               extract_credibility)
+                                               extract_priors)
 
     # Unified parsing: handles both new and legacy grammar transparently.
     # For new grammar with model(pwl/nn), credibility outputs (e.g.
@@ -448,15 +249,8 @@ def compile_jax_model(mod_string, verbose=False):
         args = [params_dict[p] for p in param_names] + list(coeff_values)
         return func_D_const(*args)
 
-    regime_spec = extract_regimes(mod_string)
+    regime_spec = None  # Legacy regimes block removed
     priors = extract_priors(mod_string)
-
-    # Legacy credibility (only when new grammar was NOT found)
-    credibility_jax = None
-    if cred_compiled is None:
-        cred_spec = extract_credibility(mod_string)
-        if cred_spec is not None:
-            credibility_jax = compile_credibility_fn_jax(cred_spec, param_names)
 
     return {
         'build_ABC': build_ABC,
@@ -471,7 +265,6 @@ def compile_jax_model(mod_string, verbose=False):
         'coefficient_names': coeff_names,
         'regime_spec': regime_spec,
         'priors': priors,
-        'credibility_jax': credibility_jax,
         'credibility_new': cred_compiled,
         'aux_resolution': jax_funcs.get('aux_resolution', {}),
         'monitor_resolution': jax_funcs.get('monitor_resolution', {}),
@@ -521,21 +314,14 @@ def inversion_filter(model, obs, params, monitor_index=None):
 
     T = obs.shape[0]
 
-    # Determine monitor variable index
+    # Determine monitor variable index from credibility block
     if monitor_index is None:
         if cred_new is not None:
             monitor_var = cred_new['input_vars'][0]
             monitor_index = var_names.index(monitor_var)
         else:
-            cred_jax = model.get('credibility_jax')
-            if cred_jax and 'monitor' in cred_jax:
-                monitor_index = var_names.index(cred_jax['monitor'])
-            elif model['regime_spec'] and 'monitor' in model['regime_spec']:
-                monitor_index = var_names.index(
-                    model['regime_spec']['monitor'])
-            else:
-                raise ValueError(
-                    "No monitor_index given and no credibility block.")
+            raise ValueError(
+                "No monitor_index given and no credibility block.")
 
     # ----- Step 1: Credibility path from observed monitor variable -----
     obs_monitor = obs[:, monitor_index]
@@ -551,21 +337,14 @@ def inversion_filter(model, obs, params, monitor_index=None):
         ss_inputs = {v: jnp.array(0.0) for v in cred_new['input_vars']}
         ss_state = {v: jnp.array(1.0) if v == 'cred_state'
                     else jnp.array(0.0) for v in cred_new['state_vars']}
+        # Lagged inputs must also be in prev_state (the credibility fn
+        # reads them from prev_state for the (-1) lag).
+        for v in cred_new.get('lagged_input_vars', []):
+            ss_state[v] = jnp.array(0.0)
         cred_params = {p: params[p] for p in cred_new['used_params']}
         out_ss, _ = cred_new['fn'](ss_inputs, ss_state, cred_params)
         omega_terminal = out_ss[cred_new['output_vars'][0]]
         A_term, B_term, C_term = build_ABC(params, omega_terminal)
-    else:
-        # Legacy: stuff omega into params dict
-        omega_H = params['omega_H']
-        omega_param = 'omega'
-        if model['regime_spec']:
-            m1_params = model['regime_spec'].get('M1_params', {})
-            if m1_params:
-                omega_param = list(m1_params.keys())[0]
-        params_M1 = dict(params)
-        params_M1[omega_param] = omega_H
-        A_term, B_term, C_term = build_ABC(params_M1)
 
     F_terminal = solve_terminal_jax(A_term, B_term, C_term)
 
@@ -583,16 +362,8 @@ def inversion_filter(model, obs, params, monitor_index=None):
     stable_M1 = converged & spec_ok
 
     # ----- Step 3: Build per-period matrices -----
-    if coeff_names:
-        # New grammar: omega_pc is a coefficient, not a parameter
-        def build_for_omega(omega_t):
-            return build_ABC(params, omega_t)
-    else:
-        # Legacy: stuff omega into params dict
-        def build_for_omega(omega_t):
-            p = dict(params)
-            p[omega_param] = omega_t
-            return build_ABC(p)
+    def build_for_omega(omega_t):
+        return build_ABC(params, omega_t)
 
     A_all, B_all, C_all = jax.vmap(build_for_omega)(omega_path)
 
@@ -723,14 +494,8 @@ def inversion_filter_partial(model, obs_partial, params,
         if cred_new is not None:
             monitor_var = cred_new['input_vars'][0]
         else:
-            cred_jax = model.get('credibility_jax')
-            if cred_jax and 'monitor' in cred_jax:
-                monitor_var = cred_jax['monitor']
-            elif model['regime_spec'] and 'monitor' in model['regime_spec']:
-                monitor_var = model['regime_spec']['monitor']
-            else:
-                raise ValueError(
-                    "No monitor_index given and no credibility block.")
+            raise ValueError(
+                "No monitor_index given and no credibility block.")
 
         full_idx = var_names.index(monitor_var)
         if full_idx in obs_indices_py:
@@ -783,21 +548,14 @@ def inversion_filter_partial(model, obs_partial, params,
         ss_inputs = {v: jnp.array(0.0) for v in cred_new['input_vars']}
         ss_state = {v: jnp.array(1.0) if v == 'cred_state'
                     else jnp.array(0.0) for v in cred_new['state_vars']}
+        # Lagged inputs must also be in prev_state (the credibility fn
+        # reads them from prev_state for the (-1) lag).
+        for v in cred_new.get('lagged_input_vars', []):
+            ss_state[v] = jnp.array(0.0)
         cred_params = {p: params[p] for p in cred_new['used_params']}
         out_ss, _ = cred_new['fn'](ss_inputs, ss_state, cred_params)
         omega_terminal = out_ss[cred_new['output_vars'][0]]
         A_term, B_term, C_term = build_ABC(params, omega_terminal)
-    else:
-        # Legacy: stuff omega into params dict
-        omega_H = params['omega_H']
-        omega_param = 'omega'
-        if model['regime_spec']:
-            m1_params = model['regime_spec'].get('M1_params', {})
-            if m1_params:
-                omega_param = list(m1_params.keys())[0]
-        params_M1 = dict(params)
-        params_M1[omega_param] = omega_H
-        A_term, B_term, C_term = build_ABC(params_M1)
 
     F_terminal = solve_terminal_jax(A_term, B_term, C_term)
 
@@ -816,14 +574,8 @@ def inversion_filter_partial(model, obs_partial, params,
     stable_M1 = converged & spec_ok
 
     # ----- Step 3: Per-period matrices -----
-    if coeff_names:
-        def build_for_omega(omega_t):
-            return build_ABC(params, omega_t)
-    else:
-        def build_for_omega(omega_t):
-            p = dict(params)
-            p[omega_param] = omega_t
-            return build_ABC(p)
+    def build_for_omega(omega_t):
+        return build_ABC(params, omega_t)
 
     A_all, B_all, C_all = jax.vmap(build_for_omega)(omega_path)
 
@@ -894,124 +646,4 @@ def inversion_filter_partial(model, obs_partial, params,
     log_lik = jnp.where(stable_M1 & jnp.isfinite(log_lik),
                         log_lik, -jnp.inf)
 
-    return log_lik, eps_all, cred_path, u_full
-
-
-# ---------------------------------------------------------------------------
-# Legacy 3-equation convenience wrapper (backward-compatible)
-# ---------------------------------------------------------------------------
-
-def build_matrices_jax(beta, sigma, kappa, rho_i, phi_pi, phi_y, omega):
-    """Build A, B, C for the 3-equation NK model (legacy, hardcoded).
-
-    DEPRECATED: Use compile_jax_model() + build_ABC() instead.
-    Kept for backward compatibility with existing scripts.
-    """
-    A = jnp.array([
-        [0.0,  0.0,     0.0,  0.0],
-        [0.0,  0.0,     0.0,  0.0],
-        [0.0,  0.0,  -rho_i,  0.0],
-        [0.0, -1.0,     0.0,  0.0],
-    ])
-    B = jnp.array([
-        [1.0,                       0.0,  sigma,              0.0],
-        [-kappa,                    1.0,    0.0, -(1.0 - omega)],
-        [-(1-rho_i)*phi_y, -(1-rho_i)*phi_pi, 1.0,        0.0],
-        [0.0,                       0.0,    0.0,            1.0],
-    ])
-    C = jnp.array([
-        [-1.0,         -sigma,  0.0,  0.0],
-        [ 0.0,  -omega * beta,  0.0,  0.0],
-        [ 0.0,            0.0,  0.0,  0.0],
-        [ 0.0,            0.0,  0.0,  0.0],
-    ])
-    return A, B, C
-
-
-def inversion_filter_jax(obs_y, obs_pi, obs_i, params):
-    """Legacy 3-equation inversion filter (backward-compatible).
-
-    DEPRECATED: Use compile_jax_model() + inversion_filter() instead.
-    Kept for backward compatibility with existing scripts.
-    """
-    T = obs_y.shape[0]
-    n = 4
-
-    beta = params['beta']
-    sigma = params['sigma']
-    kappa = params['kappa']
-    rho_i = params['rho_i']
-    phi_pi = params['phi_pi']
-    phi_y = params['phi_y']
-    omega_H = params['omega_H']
-    omega_L = params['omega_L']
-    delta_up = params['delta_up']
-    delta_down = params['delta_down']
-    epsilon_bar = params['epsilon_bar']
-    tau = params['tau']
-    sigma_d = params['sigma_d']
-    sigma_s = params['sigma_s']
-    sigma_m = params['sigma_m']
-
-    def cred_scan_fn(cred, pi_t):
-        cred_new = credibility_step(cred, pi_t, epsilon_bar, tau,
-                                     delta_up, delta_down)
-        return cred_new, cred_new
-
-    _, cred_path = lax.scan(cred_scan_fn, 1.0, obs_pi)
-    omega_path = omega_L + (omega_H - omega_L) * cred_path
-
-    A_term, B_term, C_term = build_matrices_jax(
-        beta, sigma, kappa, rho_i, phi_pi, phi_y, omega_H)
-    F_terminal = solve_terminal_jax(A_term, B_term, C_term)
-
-    def build_for_omega(omega_t):
-        return build_matrices_jax(beta, sigma, kappa, rho_i, phi_pi, phi_y,
-                                   omega_t)
-
-    A_all, B_all, C_all = jax.vmap(build_for_omega)(omega_path)
-
-    D_zero = jnp.zeros(n)
-
-    def backward_step(carry, inputs):
-        F_next, E_next = carry
-        A_t, B_t, C_t = inputs
-        M_t = B_t + C_t @ F_next
-        # Factor M_t once, reuse for F, E, Q (3 solves with 1 factorization).
-        # ~3x faster than three independent jnp.linalg.solve calls.
-        n_local = M_t.shape[0]
-        lu, piv = jax.scipy.linalg.lu_factor(M_t)
-        F_t = -jax.scipy.linalg.lu_solve((lu, piv), A_t)
-        E_t = -jax.scipy.linalg.lu_solve((lu, piv), C_t @ E_next + D_zero)
-        Q_t = -jax.scipy.linalg.lu_solve((lu, piv), jnp.eye(n_local))
-        return (F_t, E_t), (F_t, E_t, Q_t)
-
-    init_carry = (F_terminal, jnp.zeros(n))
-    _, (F_rev, E_rev, Q_rev) = lax.scan(
-        backward_step, init_carry,
-        (A_all[::-1], B_all[::-1], C_all[::-1]))
-
-    F_path = F_rev[::-1]
-    E_path = E_rev[::-1]
-    Q_path = Q_rev[::-1]
-
-    pi_lag = jnp.concatenate([jnp.array([0.0]), obs_pi[:-1]])
-    u_obs = jnp.stack([obs_y, obs_pi, obs_i, pi_lag], axis=1)
-
-    def invert_step(u_prev, inputs):
-        u_t, F_t, E_t, Q_t = inputs
-        residual = u_t - E_t - F_t @ u_prev
-        eps_t = jnp.linalg.solve(Q_t, residual)
-        return u_t, eps_t
-
-    _, eps_full = lax.scan(
-        invert_step, jnp.zeros(n),
-        (u_obs, F_path, E_path, Q_path))
-
-    eps_recovered = eps_full[:, :3]
-
-    sigma_vec = jnp.array([sigma_d, sigma_s, sigma_m])
-    log_lik = -0.5 * T * jnp.sum(jnp.log(2 * jnp.pi * sigma_vec**2)) \
-              - 0.5 * jnp.sum((eps_recovered / sigma_vec)**2)
-
-    return log_lik, eps_recovered, cred_path
+    return log_lik, eps_all, cred_path, u_full, F_path, E_path, Q_path
