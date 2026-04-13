@@ -302,8 +302,103 @@ def update_credibility(monitor_lag, cred_lag, model, params):
 
 
 # ---------------------------------------------------------------------------
+# One-step simulation: PolicyNet (direct policy, no fixed point)
+# ---------------------------------------------------------------------------
+
+def simulate_one_step_policy(u_lag, cred_lag, eps_t, net, model, params,
+                             monitor_index):
+    """Advance model one step under the PolicyNet (direct policy function).
+
+    No inner fixed-point iteration. The NN directly outputs u_t.
+
+    Parameters
+    ----------
+    u_lag : (n,) array
+    cred_lag : scalar
+    eps_t : (n_shocks,) array
+    net : PolicyNet
+        Callable net(u_lag, cred, eps) -> u_t.
+    model : dict from compile_jax_model
+    params : dict
+    monitor_index : int
+
+    Returns
+    -------
+    u_t : (n,) array
+    cred_t : scalar
+    """
+    monitor_lag = u_lag[monitor_index]
+    cred_t, omega_t = update_credibility(monitor_lag, cred_lag, model, params)
+    u_t = net(u_lag, cred_t, eps_t)
+    return u_t, cred_t
+
+
+# ---------------------------------------------------------------------------
 # One-step simulation (for training and validation)
 # ---------------------------------------------------------------------------
+
+def simulate_one_step_full(u_lag, cred_lag, eps_t, net, model, params,
+                           fwd_idx, monitor_index, n_fwd, n_inner=1):
+    """Advance model one step under the full-system NN policy.
+
+    Unlike simulate_one_step (operator-split), the NN takes (u, cred)
+    as input and predicts both forward vars AND next-period credibility.
+    This captures the covariance between inflation and credibility --
+    agents price in the RISK of credibility erosion, not just the
+    realized erosion.
+
+    Algorithm:
+      1. Compute cred_t from credibility law of motion (deterministic
+         given u_{t-1} and cred_{t-1}).
+      2. omega_t = g(cred_t) for the model matrices.
+      3. E_fwd, E_cred = net(u_{t-1}, cred_{t-1}) -- stale forecast.
+      4. Resolve u_t using E_fwd and omega_t.
+      5. Inner refinements: net(u_t^guess, cred_t) -> re-resolve.
+      6. Return (u_t, cred_t).
+
+    The credibility update at step 1 uses the LAGGED monitor from u_{t-1},
+    consistent with the BE 1304 specification pi_cpi_yoy(-1).
+
+    Parameters
+    ----------
+    u_lag : (n,) array
+    cred_lag : scalar
+    eps_t : (n_shocks,) array
+    net : FullSystemNet
+        Callable net(u, cred) -> (n_fwd+1,) array.
+    model : dict from compile_jax_model
+    params : dict
+    fwd_idx : (n_fwd,) int array
+    monitor_index : int
+    n_fwd : int
+        Number of forward variables (net output has n_fwd + 1 entries).
+    n_inner : int
+
+    Returns
+    -------
+    u_t : (n,) array
+    cred_t : scalar
+    """
+    monitor_lag = u_lag[monitor_index]
+    cred_t, omega_t = update_credibility(monitor_lag, cred_lag, model, params)
+
+    # Stale forecast from lagged state
+    out = net(u_lag, cred_lag)
+    E_fwd = out[:n_fwd]
+
+    u_t = resolve_state(u_lag, E_fwd, eps_t, model, params,
+                         fwd_idx=fwd_idx, omega_t=omega_t)
+
+    # Inner refinements: re-evaluate NN at the (improving) resolved state
+    # using cred_t (the realized credibility this period).
+    for _ in range(n_inner):
+        out = net(u_t, cred_t)
+        E_fwd = out[:n_fwd]
+        u_t = resolve_state(u_lag, E_fwd, eps_t, model, params,
+                             fwd_idx=fwd_idx, omega_t=omega_t)
+
+    return u_t, cred_t
+
 
 def simulate_one_step(u_lag, cred_lag, eps_t, net_apply, model, params,
                       fwd_idx, monitor_index, n_inner=1):

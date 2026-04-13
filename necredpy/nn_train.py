@@ -60,6 +60,7 @@ import jax.random as jrandom
 from necredpy.nn_solver import (
     discover_forward_vars,
     resolve_state,
+    simulate_one_step_full,
     update_credibility,
 )
 
@@ -111,6 +112,217 @@ class ExpectNet(eqx.Module):
         for layer in self.layers[:-1]:
             x = jnp.tanh(layer(x))
         return self.layers[-1](x)
+
+
+class FullSystemNet(eqx.Module):
+    """NN for the full nonlinear system with credibility endogenous.
+
+    Solves the FULL feedback loop: inflation -> credibility erosion ->
+    more backward-looking expectations -> more persistent inflation.
+    This is the correct nonlinear solution; the PWL operator-splitting
+    approach is the approximation (see config/nn_solver_plan.md).
+
+    Input:  (u_t, cred_t) -- n_vars + 1 dimensions
+    Output: (E_t[u_{t+1}[fwd]], E_t[cred_{t+1}]) -- n_fwd + 1 dimensions
+
+    Architecture (regime-aware LinearResidualNet):
+
+        F_blend(cred) = cred * F_high + (1 - cred) * F_low
+        linear        = [F_blend @ u,  cred]
+        correction    = MLP(u, cred) - MLP(0, 1)      (centered at SS)
+        output        = linear + correction
+
+    At steady state (u=0, cred=1): F_blend = F_high, output = (0, 1).
+    The MLP correction is zero by construction.
+
+    Why this works:
+    1. The sharp regime transition (high-cred vs low-cred policy) is
+       handled by F_blend, not the MLP. The MLP only learns the small
+       bilinear cross-term and the nonlinear credibility dynamics.
+    2. F_high and F_low are frozen (not trained). They come from
+       solve_terminal at omega_H and omega_L respectively.
+    3. The cred output teaches the NN the credibility law of motion.
+       The gradient from the cred prediction error flows back through
+       the MLP, linking inflation dynamics to credibility.
+
+    Parameters
+    ----------
+    key : PRNGKey
+    n_vars : int
+        Number of model variables (e.g. 42).
+    n_fwd : int
+        Number of forward-looking variables (e.g. 9).
+    hidden : int
+        Hidden layer width.
+    F_high : (n_fwd, n_vars) array
+        Linear policy rows at omega_H (full credibility).
+    F_low : (n_fwd, n_vars) array
+        Linear policy rows at omega_L (zero credibility).
+    """
+    layers: list
+    F_high: jnp.ndarray   # (n_fwd, n_vars) -- frozen
+    F_low: jnp.ndarray    # (n_fwd, n_vars) -- frozen
+
+    def __init__(self, key, n_vars, n_fwd, hidden, F_high, F_low):
+        if F_high.shape != (n_fwd, n_vars):
+            raise ValueError(
+                "F_high must have shape (" + str(n_fwd) + ", " + str(n_vars)
+                + ") but got " + str(F_high.shape))
+        if F_low.shape != (n_fwd, n_vars):
+            raise ValueError(
+                "F_low must have shape (" + str(n_fwd) + ", " + str(n_vars)
+                + ") but got " + str(F_low.shape))
+
+        n_in = n_vars + 1    # u + cred
+        n_out = n_fwd + 1    # fwd_vars + cred_next
+
+        keys = jrandom.split(key, 3)
+
+        # Zero-init last layer so initial correction is exactly zero
+        last_layer = eqx.nn.Linear(hidden, n_out, key=keys[2])
+        last_layer = eqx.tree_at(
+            lambda m: m.weight, last_layer,
+            jnp.zeros_like(last_layer.weight))
+        last_layer = eqx.tree_at(
+            lambda m: m.bias, last_layer,
+            jnp.zeros_like(last_layer.bias))
+
+        self.layers = [
+            eqx.nn.Linear(n_in, hidden, key=keys[0]),
+            eqx.nn.Linear(hidden, hidden, key=keys[1]),
+            last_layer,
+        ]
+        self.F_high = jnp.asarray(F_high)
+        self.F_low = jnp.asarray(F_low)
+
+    def _mlp(self, x):
+        h = x
+        for layer in self.layers[:-1]:
+            h = jnp.tanh(layer(h))
+        return self.layers[-1](h)
+
+    def __call__(self, u, cred):
+        """Predict E_t[u_{t+1}[fwd], cred_{t+1}] given (u_t, cred_t).
+
+        Parameters
+        ----------
+        u : (n_vars,) array -- model state in deviation space
+        cred : scalar -- credibility stock in [0, 1]
+
+        Returns
+        -------
+        out : (n_fwd + 1,) array
+            First n_fwd entries: E_t[u_{t+1}[fwd]]
+            Last entry: E_t[cred_{t+1}]
+        """
+        # Linear baseline: interpolate policy between regimes
+        F_blend = cred * self.F_high + (1.0 - cred) * self.F_low
+        linear_fwd = F_blend @ u
+
+        # Full linear baseline: [fwd prediction, cred persistence]
+        linear = jnp.concatenate([linear_fwd, jnp.atleast_1d(cred)])
+
+        # Nonlinear correction centered at steady state (u=0, cred=1)
+        x = jnp.concatenate([u, jnp.atleast_1d(cred)])
+        x_ss = jnp.concatenate([jnp.zeros_like(u), jnp.ones(1)])
+        correction = self._mlp(x) - self._mlp(x_ss)
+
+        return linear + correction
+
+
+class PolicyNet(eqx.Module):
+    """NN that predicts the POLICY FUNCTION u_t = g(u_{t-1}, cred_t, eps_t).
+
+    Unlike FullSystemNet (which predicts expectations and requires an inner
+    fixed-point iteration to resolve u_t), PolicyNet directly outputs u_t.
+    The Euler equation residual is then a direct function of the NN output
+    at two consecutive time steps -- NO inner fixed-point needed.
+
+    This follows Pascal (QuantEcon notebook) rather than Maliar's PEA:
+    the NN maps state -> decision, and the loss checks the Euler equation.
+
+    Architecture:
+
+        F_blend = cred * F_high + (1 - cred) * F_low
+        Q_blend = cred * Q_high + (1 - cred) * Q_low
+        linear  = F_blend @ u_{t-1} + Q_blend @ eps_t
+        correction = MLP(u_{t-1}, cred, eps_t) - MLP(0, 1, 0)
+        u_t     = linear + correction
+
+    At steady state (u=0, cred=1, eps=0): u_t = 0 exactly.
+
+    F_high, F_low: terminal policy matrices at omega_H, omega_L (full model).
+    Q_high, Q_low: impact matrices Q = (B + CF)^{-1} D at omega_H, omega_L.
+
+    Parameters
+    ----------
+    key : PRNGKey
+    n_vars : int
+    n_shocks : int
+    hidden : int
+    F_high, F_low : (n_vars, n_vars) arrays
+    Q_high, Q_low : (n_vars, n_shocks) arrays
+    """
+    layers: list
+    F_high: jnp.ndarray   # (n_vars, n_vars) -- frozen
+    F_low: jnp.ndarray    # (n_vars, n_vars) -- frozen
+    Q_high: jnp.ndarray   # (n_vars, n_shocks) -- frozen
+    Q_low: jnp.ndarray    # (n_vars, n_shocks) -- frozen
+
+    def __init__(self, key, n_vars, n_shocks, hidden, F_high, F_low, Q_high, Q_low):
+        n_in = n_vars + 1 + n_shocks   # u_lag + cred + eps
+        n_out = n_vars
+
+        keys = jrandom.split(key, 3)
+
+        # Zero-init last layer: initial correction is zero
+        last_layer = eqx.nn.Linear(hidden, n_out, key=keys[2])
+        last_layer = eqx.tree_at(
+            lambda m: m.weight, last_layer,
+            jnp.zeros_like(last_layer.weight))
+        last_layer = eqx.tree_at(
+            lambda m: m.bias, last_layer,
+            jnp.zeros_like(last_layer.bias))
+
+        self.layers = [
+            eqx.nn.Linear(n_in, hidden, key=keys[0]),
+            eqx.nn.Linear(hidden, hidden, key=keys[1]),
+            last_layer,
+        ]
+        self.F_high = jnp.asarray(F_high)
+        self.F_low = jnp.asarray(F_low)
+        self.Q_high = jnp.asarray(Q_high)
+        self.Q_low = jnp.asarray(Q_low)
+
+    def _mlp(self, x):
+        h = x
+        for layer in self.layers[:-1]:
+            h = jnp.tanh(layer(h))
+        return self.layers[-1](h)
+
+    def __call__(self, u_lag, cred, eps):
+        """Predict u_t given (u_{t-1}, cred_t, eps_t).
+
+        Parameters
+        ----------
+        u_lag : (n_vars,) array
+        cred : scalar -- credibility at time t (precomputed from law of motion)
+        eps : (n_shocks,) array -- structural shock at time t
+
+        Returns
+        -------
+        u_t : (n_vars,) array
+        """
+        F_blend = cred * self.F_high + (1.0 - cred) * self.F_low
+        Q_blend = cred * self.Q_high + (1.0 - cred) * self.Q_low
+        linear = F_blend @ u_lag + Q_blend @ eps
+
+        x = jnp.concatenate([u_lag, jnp.atleast_1d(cred), eps])
+        x_ss = jnp.concatenate([jnp.zeros_like(u_lag), jnp.ones(1),
+                                jnp.zeros_like(eps)])
+        correction = self._mlp(x) - self._mlp(x_ss)
+
+        return linear + correction
 
 
 class LinearResidualNet(eqx.Module):
@@ -284,6 +496,146 @@ def maliar_loss(net, u_t, eps_a, eps_b, cred_t, model, params,
 
     loss = jnp.mean(R_a * R_b)
     return loss, u_next_a
+
+
+def maliar_loss_full(net, u_t, eps_a, eps_b, cred_t, model, params,
+                     fwd_idx, monitor_index, n_fwd, n_inner=20):
+    """Two-draw loss for the full-system NN (credibility endogenous).
+
+    Same principle as maliar_loss, but the NN takes (u, cred) as input
+    and predicts (fwd_vars, cred_next). The cred target is deterministic
+    (depends on u_t and cred_t through the credibility law of motion),
+    so its contribution to the two-draw product is the exact squared
+    error -- no variance to average out.
+
+    Parameters
+    ----------
+    net : FullSystemNet
+        Callable net(u, cred) -> (n_fwd+1,) array.
+    u_t : (n,) array -- current state
+    eps_a, eps_b : (n_shocks,) arrays -- two independent shock draws
+    cred_t : scalar -- current credibility stock
+    model, params : as in nn_solver
+    fwd_idx : (n_fwd,) int array
+    monitor_index : int
+    n_fwd : int
+    n_inner : int
+
+    Returns
+    -------
+    loss : scalar
+    u_next_a : (n,) array -- for advancing the simulation carry
+    cred_next : scalar -- for advancing the credibility carry
+    """
+    # NN prediction of E_t[u_{t+1}[fwd], cred_{t+1}]
+    out_t = net(u_t, cred_t)
+    E_fwd = out_t[:n_fwd]
+    E_cred = out_t[n_fwd]
+
+    # Next-period credibility from the law of motion (deterministic)
+    monitor_t = u_t[monitor_index]
+    cred_next, omega_next = update_credibility(
+        monitor_t, cred_t, model, params)
+
+    # First-pass resolve under each shock
+    u_next_a = resolve_state(u_t, E_fwd, eps_a, model, params,
+                              fwd_idx=fwd_idx, omega_t=omega_next)
+    u_next_b = resolve_state(u_t, E_fwd, eps_b, model, params,
+                              fwd_idx=fwd_idx, omega_t=omega_next)
+
+    # Inner refinements: re-evaluate NN at the resolved states using
+    # the realized cred_next (fixed for all inner iterations).
+    for _ in range(n_inner):
+        out_a = net(u_next_a, cred_next)
+        out_b = net(u_next_b, cred_next)
+        u_next_a = resolve_state(u_t, out_a[:n_fwd], eps_a, model, params,
+                                  fwd_idx=fwd_idx, omega_t=omega_next)
+        u_next_b = resolve_state(u_t, out_b[:n_fwd], eps_b, model, params,
+                                  fwd_idx=fwd_idx, omega_t=omega_next)
+
+    # Targets: realized forward vars + deterministic cred
+    actual_a = jnp.concatenate([u_next_a[fwd_idx], jnp.atleast_1d(cred_next)])
+    actual_b = jnp.concatenate([u_next_b[fwd_idx], jnp.atleast_1d(cred_next)])
+
+    # Two-draw residuals against the full prediction
+    E_full = jnp.concatenate([E_fwd, jnp.atleast_1d(E_cred)])
+    R_a = actual_a - E_full
+    R_b = actual_b - E_full
+
+    loss = jnp.mean(R_a * R_b)
+    return loss, u_next_a, cred_next
+
+
+def euler_residual_loss(net, u_lag, cred_lag, eps_t, eps_a, eps_b,
+                        model, params, monitor_index):
+    """Two-draw Euler-residual loss for PolicyNet (no inner fixed point).
+
+    The NN directly predicts u_t = net(u_lag, cred_t, eps_t). The Euler
+    equation residual is then computed from two independent next-period
+    shock draws, giving an unbiased estimator of ||E[residual]||^2.
+
+    Flow (3 NN forward passes, zero inner iterations):
+      1. cred_t = credibility_law_of_motion(cred_lag, monitor(u_lag))
+      2. u_t = net(u_lag, cred_t, eps_t)
+      3. cred_{t+1} = credibility_law_of_motion(cred_t, monitor(u_t))
+      4. u_{t+1}^a = net(u_t, cred_{t+1}, eps_a)
+      5. u_{t+1}^b = net(u_t, cred_{t+1}, eps_b)
+      6. R_a = A u_lag + B u_t + C u_{t+1}^a - D eps_t
+      7. R_b = A u_lag + B u_t + C u_{t+1}^b - D eps_t
+      8. Loss = mean(R_a * R_b)
+
+    For predetermined equations (C_j = 0), R_a_j = R_b_j, so the
+    product is the exact squared residual. For forward-looking equations
+    (C_j != 0), the two-draw trick gives an unbiased estimator.
+
+    Parameters
+    ----------
+    net : PolicyNet
+        Callable net(u_lag, cred, eps) -> u_t.
+    u_lag : (n,) array
+    cred_lag : scalar
+    eps_t : (n_shocks,) array -- current-period shock
+    eps_a, eps_b : (n_shocks,) arrays -- two independent next-period draws
+    model, params : as in nn_solver
+    monitor_index : int
+
+    Returns
+    -------
+    loss : scalar
+    u_t : (n,) array -- for advancing the simulation carry
+    cred_t : scalar
+    """
+    # Step 1: current-period credibility
+    monitor_lag = u_lag[monitor_index]
+    cred_t, omega_t = update_credibility(monitor_lag, cred_lag, model, params)
+
+    # Step 2: NN predicts u_t directly
+    u_t = net(u_lag, cred_t, eps_t)
+
+    # Step 3: next-period credibility
+    monitor_t = u_t[monitor_index]
+    cred_next, omega_next = update_credibility(monitor_t, cred_t, model, params)
+
+    # Steps 4-5: next-period states under two independent shocks
+    u_next_a = net(u_t, cred_next, eps_a)
+    u_next_b = net(u_t, cred_next, eps_b)
+
+    # Steps 6-7: Euler residuals at the CURRENT period's matrices
+    coeff_names = model.get("coefficient_names", [])
+    if coeff_names:
+        A, B, C = model["build_ABC"](params, omega_t)
+        D = model["build_D"](params, omega_t)
+    else:
+        A, B, C = model["build_ABC"](params)
+        D = model["build_D"](params)
+
+    # Sign convention: A u_lag + B u_t + C u_next - D eps_t = 0
+    R_a = A @ u_lag + B @ u_t + C @ u_next_a - D @ eps_t
+    R_b = A @ u_lag + B @ u_t + C @ u_next_b - D @ eps_t
+
+    # Step 8: two-draw product (unbiased estimator of squared residual)
+    loss = jnp.mean(R_a * R_b)
+    return loss, u_t, cred_t
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +952,369 @@ def train(model, params, net_init,
         "final_cred": cred_final,
         "fwd_idx": fwd_idx,
         "fwd_names": fwd_names,
+        "monitor_index": monitor_index,
+        "shock_stds": shock_stds,
+    }
+    return net_ema_final, history
+
+
+# ---------------------------------------------------------------------------
+# Full-system training loop (credibility endogenous)
+# ---------------------------------------------------------------------------
+
+def train_full(model, params, net_init,
+               n_steps=20000,
+               learning_rate=1e-3,
+               shock_stds=None,
+               monitor_index=None,
+               seed=0,
+               report_every=1000,
+               reset_every=500,
+               n_inner=20,
+               shock_scale=5.0,
+               batch_size=16,
+               final_lr_ratio=0.01,
+               ema_decay=0.999):
+    """Train a FullSystemNet via online Maliar with credibility endogenous.
+
+    Same Maliar two-draw method as train(), but uses maliar_loss_full
+    which passes (u, cred) to the NN and targets both forward vars and
+    credibility. The NN learns the full nonlinear feedback loop.
+
+    Parameters
+    ----------
+    model : dict from compile_jax_model
+    params : dict
+    net_init : FullSystemNet
+        Must have signature net(u, cred) -> (n_fwd+1,).
+    n_steps, learning_rate, shock_stds, monitor_index, seed,
+    report_every, reset_every, n_inner, shock_scale, batch_size,
+    final_lr_ratio, ema_decay : same as train().
+
+    Returns
+    -------
+    net : FullSystemNet (EMA-averaged)
+    history : dict with 'loss', 'final_state', 'final_cred', etc.
+    """
+    n = model["n_vars"]
+    n_shocks = model["n_shocks"]
+    var_names = model["var_names"]
+
+    fwd_idx, fwd_names = discover_forward_vars(model, params)
+    n_fwd = int(fwd_idx.shape[0])
+
+    # Verify net output dimension: n_fwd + 1 (fwd vars + cred)
+    test_out = net_init(jnp.zeros(n), jnp.array(1.0))
+    if int(test_out.shape[0]) != n_fwd + 1:
+        raise ValueError(
+            "FullSystemNet output dim (" + str(test_out.shape[0])
+            + ") must be n_fwd + 1 = " + str(n_fwd + 1))
+
+    # Default monitor index
+    if monitor_index is None:
+        cred_new = model.get("credibility_new")
+        cred_jax = model.get("credibility_jax")
+        if cred_new and cred_new.get("input_vars"):
+            monitor_index = var_names.index(cred_new["input_vars"][0])
+        elif cred_jax and "monitor" in cred_jax:
+            monitor_index = var_names.index(cred_jax["monitor"])
+        else:
+            monitor_index = 0
+
+    # Default shock stds
+    if shock_stds is None:
+        shock_stds = jnp.array([
+            float(params["sigma_" + s]) for s in model["shock_names"]
+        ])
+    else:
+        shock_stds = jnp.asarray(shock_stds, dtype=jnp.float64)
+    shock_stds = shock_stds * float(shock_scale)
+
+    # Optimizer with cosine decay
+    if final_lr_ratio <= 0 or final_lr_ratio >= 1:
+        lr_schedule = learning_rate
+    else:
+        lr_schedule = optax.cosine_decay_schedule(
+            init_value=learning_rate,
+            decay_steps=max(1, n_steps),
+            alpha=final_lr_ratio,
+        )
+    optimizer = optax.adam(lr_schedule)
+    opt_state = optimizer.init(eqx.filter(net_init, eqx.is_inexact_array))
+
+    # Freeze F_high and F_low (linear baselines, not trained)
+    F_high_init = net_init.F_high
+    F_low_init = net_init.F_low
+
+    def _freeze_baselines(net_any):
+        net_any = eqx.tree_at(lambda m: m.F_high, net_any, F_high_init)
+        net_any = eqx.tree_at(lambda m: m.F_low, net_any, F_low_init)
+        return net_any
+
+    # EMA tracking
+    ema_params, net_static = eqx.partition(net_init, eqx.is_inexact_array)
+
+    def _ema_update(ema, current):
+        return jax.tree_util.tree_map(
+            lambda e, c: ema_decay * e + (1.0 - ema_decay) * c,
+            ema, current)
+
+    # One training step
+    def step_fn(carry, key):
+        u_t, cred_t, net, opt_state, ema_params = carry
+
+        # Batched two-draw shocks
+        k_a, k_b = jrandom.split(key)
+        eps_a_batch = jrandom.normal(k_a, (batch_size, n_shocks)) * shock_stds
+        eps_b_batch = jrandom.normal(k_b, (batch_size, n_shocks)) * shock_stds
+
+        def loss_batched(net_arg):
+            def one_pair(ea, eb):
+                loss_i, u_next_i, cred_next_i = maliar_loss_full(
+                    net_arg, u_t, ea, eb, cred_t, model, params,
+                    fwd_idx, monitor_index, n_fwd, n_inner=n_inner)
+                return loss_i, (u_next_i, cred_next_i)
+
+            losses_batch, (u_next_batch, cred_next_batch) = jax.vmap(
+                one_pair)(eps_a_batch, eps_b_batch)
+            return jnp.mean(losses_batch), (u_next_batch[0],
+                                             cred_next_batch[0])
+
+        (loss_val, (u_next, cred_next)), grads = eqx.filter_value_and_grad(
+            loss_batched, has_aux=True)(net)
+
+        updates, opt_state = optimizer.update(grads, opt_state, net)
+        net = eqx.apply_updates(net, updates)
+        net = _freeze_baselines(net)
+
+        current_params, _ = eqx.partition(net, eqx.is_inexact_array)
+        ema_params = _ema_update(ema_params, current_params)
+
+        new_carry = (u_next, cred_next, net, opt_state, ema_params)
+        return new_carry, loss_val
+
+    warm_start = jnp.zeros(n)
+    init_carry = (warm_start, jnp.array(1.0), net_init, opt_state, ema_params)
+
+    # Python loop with reporting
+    if report_every and report_every > 0:
+        step_jit = eqx.filter_jit(step_fn)
+        carry = init_carry
+        losses = []
+        key = jrandom.PRNGKey(seed)
+        for i in range(n_steps):
+            key, subkey = jrandom.split(key)
+            carry, loss_val = step_jit(carry, subkey)
+            losses.append(float(loss_val))
+
+            if reset_every > 0 and (i + 1) % reset_every == 0:
+                u_t, cred_t, net_, opt_state_, ema_params_ = carry
+                carry = (warm_start, jnp.array(1.0), net_,
+                         opt_state_, ema_params_)
+
+            if (i + 1) % report_every == 0:
+                ema = sum(losses[-report_every:]) / report_every
+                print("  step " + str(i + 1).rjust(6) + " / "
+                      + str(n_steps) + "  loss(EMA " + str(report_every)
+                      + ") = " + ("%.4e" % ema))
+        losses = jnp.array(losses)
+    else:
+        keys = jrandom.split(jrandom.PRNGKey(seed), n_steps)
+        carry, losses = jax.lax.scan(step_fn, init_carry, keys)
+
+    u_final, cred_final, net_final, _, ema_params_final = carry
+    net_ema_final = eqx.combine(ema_params_final, net_static)
+
+    history = {
+        "loss": losses,
+        "final_state": u_final,
+        "final_cred": cred_final,
+        "fwd_idx": fwd_idx,
+        "fwd_names": fwd_names,
+        "n_fwd": n_fwd,
+        "monitor_index": monitor_index,
+        "shock_stds": shock_stds,
+    }
+    return net_ema_final, history
+
+
+# ---------------------------------------------------------------------------
+# Policy-function training loop (no inner fixed point)
+# ---------------------------------------------------------------------------
+
+def train_policy(model, params, net_init,
+                 n_steps=20000,
+                 learning_rate=1e-3,
+                 shock_stds=None,
+                 monitor_index=None,
+                 seed=0,
+                 report_every=1000,
+                 reset_every=500,
+                 shock_scale=5.0,
+                 batch_size=64,
+                 final_lr_ratio=0.01,
+                 ema_decay=0.999):
+    """Train a PolicyNet via Euler-residual loss (Pascal/two-draw, no fixed point).
+
+    Unlike train() and train_full(), this uses euler_residual_loss which
+    evaluates the NN at three consecutive states (u_lag -> u_t -> u_{t+1})
+    without any inner fixed-point iteration. The Euler equation residual
+    is checked directly.
+
+    Because there is no n_inner loop, each training step is O(3) NN
+    forward passes instead of O(n_inner) -- dramatically faster per step,
+    and the gradient is UNBIASED regardless of max|eig(F)|.
+
+    Parameters
+    ----------
+    model : dict from compile_jax_model
+    params : dict
+    net_init : PolicyNet
+        Must have signature net(u_lag, cred, eps) -> u_t.
+    n_steps, learning_rate, shock_stds, monitor_index, seed,
+    report_every, reset_every, shock_scale, batch_size,
+    final_lr_ratio, ema_decay : same semantics as train().
+
+    Returns
+    -------
+    net : PolicyNet (EMA-averaged)
+    history : dict with 'loss', 'final_state', 'final_cred', etc.
+    """
+    n = model["n_vars"]
+    n_shocks = model["n_shocks"]
+    var_names = model["var_names"]
+
+    # Verify net output dimension
+    test_out = net_init(jnp.zeros(n), jnp.array(1.0), jnp.zeros(n_shocks))
+    if int(test_out.shape[0]) != n:
+        raise ValueError(
+            "PolicyNet output dim (" + str(test_out.shape[0])
+            + ") must equal n_vars = " + str(n))
+
+    # Default monitor index
+    if monitor_index is None:
+        cred_new = model.get("credibility_new")
+        cred_jax = model.get("credibility_jax")
+        if cred_new and cred_new.get("input_vars"):
+            monitor_index = var_names.index(cred_new["input_vars"][0])
+        elif cred_jax and "monitor" in cred_jax:
+            monitor_index = var_names.index(cred_jax["monitor"])
+        else:
+            monitor_index = 0
+
+    # Default shock stds
+    if shock_stds is None:
+        shock_stds = jnp.array([
+            float(params["sigma_" + s]) for s in model["shock_names"]
+        ])
+    else:
+        shock_stds = jnp.asarray(shock_stds, dtype=jnp.float64)
+    shock_stds = shock_stds * float(shock_scale)
+
+    # Optimizer with cosine decay
+    if final_lr_ratio <= 0 or final_lr_ratio >= 1:
+        lr_schedule = learning_rate
+    else:
+        lr_schedule = optax.cosine_decay_schedule(
+            init_value=learning_rate,
+            decay_steps=max(1, n_steps),
+            alpha=final_lr_ratio,
+        )
+    optimizer = optax.adam(lr_schedule)
+    opt_state = optimizer.init(eqx.filter(net_init, eqx.is_inexact_array))
+
+    # Freeze linear baselines (F_high, F_low, Q_high, Q_low)
+    F_high_init = net_init.F_high
+    F_low_init = net_init.F_low
+    Q_high_init = net_init.Q_high
+    Q_low_init = net_init.Q_low
+
+    def _freeze_baselines(net_any):
+        net_any = eqx.tree_at(lambda m: m.F_high, net_any, F_high_init)
+        net_any = eqx.tree_at(lambda m: m.F_low, net_any, F_low_init)
+        net_any = eqx.tree_at(lambda m: m.Q_high, net_any, Q_high_init)
+        net_any = eqx.tree_at(lambda m: m.Q_low, net_any, Q_low_init)
+        return net_any
+
+    # EMA tracking
+    ema_params, net_static = eqx.partition(net_init, eqx.is_inexact_array)
+
+    def _ema_update(ema, current):
+        return jax.tree_util.tree_map(
+            lambda e, c: ema_decay * e + (1.0 - ema_decay) * c,
+            ema, current)
+
+    # One training step
+    def step_fn(carry, key):
+        u_lag, cred_lag, net, opt_state, ema_params = carry
+
+        # Three independent shock draws: current period + two next-period
+        k_t, k_a, k_b = jrandom.split(key, 3)
+        eps_t_batch = jrandom.normal(k_t, (batch_size, n_shocks)) * shock_stds
+        eps_a_batch = jrandom.normal(k_a, (batch_size, n_shocks)) * shock_stds
+        eps_b_batch = jrandom.normal(k_b, (batch_size, n_shocks)) * shock_stds
+
+        def loss_batched(net_arg):
+            def one_sample(eps_t, eps_a, eps_b):
+                loss_i, u_t_i, cred_t_i = euler_residual_loss(
+                    net_arg, u_lag, cred_lag, eps_t, eps_a, eps_b,
+                    model, params, monitor_index)
+                return loss_i, (u_t_i, cred_t_i)
+
+            losses, (u_ts, cred_ts) = jax.vmap(one_sample)(
+                eps_t_batch, eps_a_batch, eps_b_batch)
+            # Advance carry using first sample's u_t
+            return jnp.mean(losses), (u_ts[0], cred_ts[0])
+
+        (loss_val, (u_next, cred_next)), grads = eqx.filter_value_and_grad(
+            loss_batched, has_aux=True)(net)
+
+        updates, opt_state = optimizer.update(grads, opt_state, net)
+        net = eqx.apply_updates(net, updates)
+        net = _freeze_baselines(net)
+
+        current_params, _ = eqx.partition(net, eqx.is_inexact_array)
+        ema_params = _ema_update(ema_params, current_params)
+
+        new_carry = (u_next, cred_next, net, opt_state, ema_params)
+        return new_carry, loss_val
+
+    warm_start = jnp.zeros(n)
+    init_carry = (warm_start, jnp.array(1.0), net_init, opt_state, ema_params)
+
+    # Python loop with reporting
+    if report_every and report_every > 0:
+        step_jit = eqx.filter_jit(step_fn)
+        carry = init_carry
+        losses = []
+        key = jrandom.PRNGKey(seed)
+        for i in range(n_steps):
+            key, subkey = jrandom.split(key)
+            carry, loss_val = step_jit(carry, subkey)
+            losses.append(float(loss_val))
+
+            if reset_every > 0 and (i + 1) % reset_every == 0:
+                u_t, cred_t, net_, opt_state_, ema_params_ = carry
+                carry = (warm_start, jnp.array(1.0), net_,
+                         opt_state_, ema_params_)
+
+            if (i + 1) % report_every == 0:
+                ema = sum(losses[-report_every:]) / report_every
+                print("  step " + str(i + 1).rjust(6) + " / "
+                      + str(n_steps) + "  loss(EMA " + str(report_every)
+                      + ") = " + ("%.4e" % ema))
+        losses = jnp.array(losses)
+    else:
+        keys = jrandom.split(jrandom.PRNGKey(seed), n_steps)
+        carry, losses = jax.lax.scan(step_fn, init_carry, keys)
+
+    u_final, cred_final, net_final, _, ema_params_final = carry
+    net_ema_final = eqx.combine(ema_params_final, net_static)
+
+    history = {
+        "loss": losses,
+        "final_state": u_final,
+        "final_cred": cred_final,
         "monitor_index": monitor_index,
         "shock_stds": shock_stds,
     }
