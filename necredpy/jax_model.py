@@ -514,7 +514,21 @@ def inversion_filter_partial(model, obs_partial, params,
                 )
             terms = monitor_resolution[monitor_var]
             obs_monitor = jnp.zeros(T)
-            for src_var, lag, coeff in terms:
+            for entry in terms:
+                # Backward-compatible dispatch:
+                #   3-tuple = (src, lag, float_coeff)  -- legacy parser
+                #   4-tuple = (src, lag, coeff, used_params)
+                #     coeff is float when used_params is None,
+                #     else a JAX-callable taking *[params[p] for p in used_params].
+                if len(entry) == 3:
+                    src_var, lag, coeff = entry
+                    coeff_val = coeff
+                else:
+                    src_var, lag, coeff, used_params = entry
+                    if used_params is None:
+                        coeff_val = coeff
+                    else:
+                        coeff_val = coeff(*[params[p] for p in used_params])
                 src_full = var_names.index(src_var)
                 if src_full not in obs_indices_py:
                     raise ValueError(
@@ -533,7 +547,7 @@ def inversion_filter_partial(model, obs_partial, params,
                     k = lag
                     pad = jnp.full((k,), series[-1])
                     shifted = jnp.concatenate([series[k:], pad])
-                obs_monitor = obs_monitor + coeff * shifted
+                obs_monitor = obs_monitor + coeff_val * shifted
     else:
         obs_monitor = obs_partial[:, monitor_index]
 

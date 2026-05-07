@@ -620,42 +620,30 @@ def parse_mod(mod_string, verbose=False, coefficient_names=None):
             continue
         # Collect dependencies: contemporaneous (lag 0) from B, lagged
         # (lag -1) from A. Skip self-reference at lag 0.
-        # If ANY coefficient is parameter-dependent (not purely numeric),
-        # skip the entire equation. The owner becomes a "source" node
-        # that must be observed directly. This prevents the resolution
-        # graph from walking through equations like
-        #   pi_cpi = pi_dom + f(alpha_m)*(q - q(-1))
-        # where the coefficients depend on parameters. Variables like
-        # pi_cpi_yoy that reference pi_cpi will stop at pi_cpi (source)
-        # rather than trying to resolve further through pi_cpi.
+        # Edge weights are stored as Python floats when -coeff/b_jj is
+        # purely numeric, and as sympy.Expr when the ratio depends on
+        # estimated parameters. The downstream lambdify pass converts
+        # any remaining symbolic edge weights into JAX-callable
+        # functions of params.
         edges = []
-        has_param_dep = False
         for k in range(num_vars):
             if k == j:
                 continue
             coeff = sympy_B[eq_i, k]
             if coeff == 0:
                 continue
-            try:
-                w = float(-coeff / b_jj)
-            except (TypeError, ValueError):
-                has_param_dep = True
-                break
+            w = -coeff / b_jj
+            if hasattr(w, 'is_Number') and w.is_Number:
+                w = float(w)
             edges.append((owner, var_names[k], 0, w))
-        if has_param_dep:
-            continue
         for k in range(num_vars):
             coeff = sympy_A[eq_i, k]
             if coeff == 0:
                 continue
-            try:
-                w = float(-coeff / b_jj)
-            except (TypeError, ValueError):
-                has_param_dep = True
-                break
+            w = -coeff / b_jj
+            if hasattr(w, 'is_Number') and w.is_Number:
+                w = float(w)
             edges.append((owner, var_names[k], -1, w))
-        if has_param_dep:
-            continue
         for src, dst, lag, w in edges:
             dep_graph.add_edge(src, dst, lag=lag, weight=w)
 
@@ -688,13 +676,25 @@ def parse_mod(mod_string, verbose=False, coefficient_names=None):
         for _, neighbor, data in dep_graph.out_edges(var_name, data=True):
             w = data.get('weight')
             if w is None:
-                raise _Unresolvable(f"param edge at {var_name}->{neighbor}")
+                raise _Unresolvable(f"None edge at {var_name}->{neighbor}")
             edge_lag = data.get('lag', 0)
-            _resolve_graph(neighbor, lag_acc + edge_lag, coeff_acc * w,
+            new_coeff = coeff_acc * w
+            # Collapse to float when the symbolic product simplifies
+            # to a number; keep symbolic otherwise.
+            if hasattr(new_coeff, 'is_Number') and new_coeff.is_Number:
+                new_coeff = float(new_coeff)
+            _resolve_graph(neighbor, lag_acc + edge_lag, new_coeff,
                            out_terms, depth + 1)
 
     # Build monitor_resolution map for every variable that has a defining
     # equation (i.e., is a node in dep_graph with outgoing edges).
+    # Entries are stored as 4-tuples: (src_var, lag, coeff, used_params)
+    #   - If the resolution is purely numeric:
+    #       coeff = float, used_params = None
+    #   - If the resolution depends on estimated parameters:
+    #       coeff = JAX-callable produced by sympy.lambdify,
+    #       used_params = ordered list of parameter names to look up
+    #       in the params dict at filter time.
     monitor_resolution = {}
     for var in dep_graph.nodes():
         if dep_graph.out_degree(var) == 0:
@@ -704,19 +704,43 @@ def parse_mod(mod_string, verbose=False, coefficient_names=None):
             _resolve_graph(var, 0, 1.0, raw_terms)
         except _Unresolvable:
             continue  # silently skip; not all variables are data-computable
+        # Collapse identical (src, lag) keys. coeff_acc may be float or
+        # sympy.Expr; addition between the two is handled by sympy.
         collapsed = {}
         for src, lag, c in raw_terms:
-            collapsed[(src, lag)] = collapsed.get((src, lag), 0.0) + c
-        entries = [(src, lag, c) for (src, lag), c in collapsed.items()
-                   if abs(c) > 1e-14]
+            key = (src, lag)
+            if key in collapsed:
+                collapsed[key] = collapsed[key] + c
+            else:
+                collapsed[key] = c
+        entries = []
+        for (src, lag), c in collapsed.items():
+            # Try to collapse to float after summation.
+            if hasattr(c, 'is_Number') and c.is_Number:
+                c = float(c)
+            if isinstance(c, float):
+                if abs(c) <= 1e-14:
+                    continue
+                entries.append((src, lag, c, None))
+            else:
+                # Symbolic coefficient -- lambdify it for use at filter time.
+                free = sorted(c.free_symbols, key=lambda s: str(s))
+                free_names = [str(s) for s in free]
+                fn = sympy.lambdify(free, c, modules='jax')
+                entries.append((src, lag, fn, free_names))
         monitor_resolution[var] = entries
 
     if verbose and monitor_resolution:
         print(f"monitor_resolution ({len(monitor_resolution)} variables "
               "resolved to observables):")
         for v, entries in monitor_resolution.items():
-            desc = " + ".join(f"{c:.4g}*{src}({lag:+d})" for src, lag, c in entries)
-            print(f"  {v} = {desc}")
+            parts = []
+            for src, lag, c, used in entries:
+                if used is None:
+                    parts.append(f"{c:.4g}*{src}({lag:+d})")
+                else:
+                    parts.append(f"f({','.join(used)})*{src}({lag:+d})")
+            print(f"  {v} = " + " + ".join(parts))
 
     # --- Step 5: Extract constant terms ---
     # D_const[i] = F_i evaluated at all variables = 0 and all shocks = 0
