@@ -64,7 +64,7 @@ class Model:
     def estimate(self, data, obs_vars, shock_vars=None, tau=0.2,
                  num_warmup=500, num_samples=500, num_chains=2,
                  target_accept_prob=0.8, max_tree_depth=10,
-                 seed=0, progress_bar=True):
+                 seed=0, progress_bar=True, init_strategy="uniform"):
         """Bayesian estimation via NumPyro NUTS.
 
         Parameters
@@ -93,6 +93,12 @@ class Model:
             Random seed for MCMC.
         progress_bar : bool
             Show NumPyro progress bar.
+        init_strategy : str
+            Chain initialization: 'uniform' (NumPyro default,
+            init_to_uniform over the transformed space), 'median'
+            (prior median; recommended to avoid chains starting in
+            far-away basins and getting stuck through warmup),
+            'sample' (a prior draw), or 'mean' (prior mean).
 
         Returns
         -------
@@ -155,9 +161,17 @@ class Model:
             numpyro.factor('log_lik', ll)
 
         # Run MCMC
+        from numpyro.infer import (init_to_uniform, init_to_median,
+                                   init_to_sample, init_to_mean)
+        init_map = {"uniform": init_to_uniform, "median": init_to_median,
+                    "sample": init_to_sample, "mean": init_to_mean}
+        if init_strategy not in init_map:
+            raise ValueError("init_strategy must be one of "
+                             + ", ".join(sorted(init_map)))
         kernel = NUTS(nk_model,
                       target_accept_prob=target_accept_prob,
-                      max_tree_depth=max_tree_depth)
+                      max_tree_depth=max_tree_depth,
+                      init_strategy=init_map[init_strategy]())
         mcmc = MCMC(kernel,
                     num_warmup=num_warmup,
                     num_samples=num_samples,
